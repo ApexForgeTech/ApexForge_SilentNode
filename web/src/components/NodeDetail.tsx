@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import type { SNode } from '../types'
 import { api } from '../api'
 import { toast } from './Toast'
@@ -48,6 +48,9 @@ export default function NodeDetail({ node, nodes = [], onClose, onRefresh }: Pro
   const [scheduleReminderMinutes, setScheduleReminderMinutes] = useState(String(node.schedule?.reminder_minutes_before || 10))
   const [scheduleDays, setScheduleDays] = useState<number[]>(node.schedule?.days_of_week || [])
   const [linkQuery, setLinkQuery] = useState('')
+  const [attachments, setAttachments] = useState<{ filename: string; size: number; url: string; is_image: boolean }[]>([])
+  const [uploading, setUploading] = useState(false)
+  const fileInputRef = useRef<HTMLInputElement>(null)
   const [ghostRisk, setGhostRisk] = useState<{
     risk_level: string; days_to_ghost: number; risk_score: number
   } | null>(null)
@@ -81,6 +84,10 @@ export default function NodeDetail({ node, nodes = [], onClose, onRefresh }: Pro
 
     // ML next focus from this node
     api.mlNextFocus(node.id).then(nf => setNextFocus(nf.slice(0, 3))).catch(() => {})
+
+    // load attachments
+    fetch(`/api/nodes/${node.id}/attachments`)
+      .then(r => r.json()).then(setAttachments).catch(() => {})
   }, [node.id])
   const col  = node.node_type === 'other' && node.aura_color?.startsWith('#')
     ? node.aura_color
@@ -398,6 +405,29 @@ export default function NodeDetail({ node, nodes = [], onClose, onRefresh }: Pro
               DeepWork
             </button>
           </div>
+          <div style={{ display: 'flex', gap: 5, marginTop: 6, alignItems: 'center' }}>
+            <input
+              id={`custom-focus-${node.id}`}
+              type="number"
+              min={1}
+              max={600}
+              defaultValue={40}
+              style={{ width: 60, padding: '3px 6px', fontSize: 11, borderRadius: 4, border: '1px solid var(--border)', background: 'var(--bg2)', color: 'var(--t1)' }}
+              placeholder="min"
+            />
+            <span style={{ fontSize: 10, color: 'var(--t4)' }}>min</span>
+            <button
+              className="btn-sm"
+              disabled={busy}
+              onClick={() => {
+                const el = document.getElementById(`custom-focus-${node.id}`) as HTMLInputElement
+                const mins = Math.max(1, parseInt(el?.value || '0') || 0)
+                act(`${mins} min recorded`, () => api.recordFocus(node.id, mins * 60, 'DeepWork'))
+              }}
+            >
+              + Log
+            </button>
+          </div>
         </div>
 
         {/* ML Ghost Risk */}
@@ -492,6 +522,81 @@ export default function NodeDetail({ node, nodes = [], onClose, onRefresh }: Pro
           >
             Delete node
           </button>
+        </div>
+
+        {/* Attachments */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span style={{ color: 'var(--t3)', fontSize: 10, fontWeight: 600, textTransform: 'uppercase', letterSpacing: 1 }}>Attachments</span>
+            <button
+              className="btn-xs"
+              disabled={uploading}
+              onClick={() => fileInputRef.current?.click()}
+              style={{ marginLeft: 'auto' }}
+            >
+              {uploading ? 'Uploading…' : '+ Add file'}
+            </button>
+            <input
+              ref={fileInputRef}
+              type="file"
+              multiple
+              style={{ display: 'none' }}
+              onChange={async e => {
+                const files = e.target.files
+                if (!files || files.length === 0) return
+                setUploading(true)
+                const form = new FormData()
+                Array.from(files).forEach(f => form.append('file', f))
+                try {
+                  await fetch(`/api/nodes/${node.id}/attachments`, { method: 'POST', body: form })
+                  const updated = await fetch(`/api/nodes/${node.id}/attachments`).then(r => r.json())
+                  setAttachments(updated)
+                  toast('Uploaded')
+                } catch { toast('Upload failed', 'error') }
+                setUploading(false)
+                e.target.value = ''
+              }}
+            />
+          </div>
+          {attachments.length === 0 && (
+            <span style={{ color: 'var(--t5)', fontSize: 10 }}>No attachments</span>
+          )}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+            {attachments.map(a => (
+              <div key={a.filename} style={{ display: 'flex', alignItems: 'center', gap: 6, background: 'var(--bg2)', borderRadius: 4, padding: '4px 6px' }}>
+                {a.is_image && (
+                  <img
+                    src={a.url}
+                    alt={a.filename}
+                    style={{ width: 32, height: 32, objectFit: 'cover', borderRadius: 3, flexShrink: 0, cursor: 'pointer' }}
+                    onClick={() => window.open(a.url, '_blank')}
+                  />
+                )}
+                {!a.is_image && (
+                  <span style={{ fontSize: 16, flexShrink: 0 }}>📎</span>
+                )}
+                <a
+                  href={a.url}
+                  target="_blank"
+                  rel="noreferrer"
+                  style={{ color: 'var(--t2)', fontSize: 11, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                >
+                  {a.filename}
+                </a>
+                <span style={{ color: 'var(--t5)', fontSize: 9, flexShrink: 0 }}>
+                  {a.size < 1024 ? `${a.size}B` : a.size < 1048576 ? `${(a.size/1024).toFixed(1)}KB` : `${(a.size/1048576).toFixed(1)}MB`}
+                </span>
+                <button
+                  className="btn-xs btn-danger"
+                  style={{ padding: '1px 5px', fontSize: 9 }}
+                  onClick={async () => {
+                    await fetch(`/api/nodes/${node.id}/attachments/${encodeURIComponent(a.filename)}`, { method: 'DELETE' })
+                    setAttachments(prev => prev.filter(x => x.filename !== a.filename))
+                  }}
+                >✕</button>
+              </div>
+            ))}
+          </div>
         </div>
 
         {/* Aura */}

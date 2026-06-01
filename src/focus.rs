@@ -38,6 +38,12 @@ impl FocusTrailEngine {
         &self.events
     }
 
+    pub fn remove_session(&mut self, session_id: Uuid) -> bool {
+        let before = self.events.len();
+        self.events.retain(|e| e.session_id != session_id);
+        self.events.len() < before
+    }
+
     pub fn trail_between(&self, from: DateTime<Utc>, to: DateTime<Utc>) -> Vec<FocusEvent> {
         self.events
             .iter()

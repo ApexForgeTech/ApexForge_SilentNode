@@ -139,6 +139,16 @@ export default function TrailView() {
                     </span>
                   </div>
                 </div>
+                <button
+                  className="btn-xs btn-danger"
+                  style={{ padding: '1px 5px', fontSize: 9, flexShrink: 0, opacity: 0.6 }}
+                  onClick={async e => {
+                    e.stopPropagation()
+                    await fetch(`/api/focus/${ev.session_id}`, { method: 'DELETE' })
+                    setTrail(prev => prev.filter(x => x.session_id !== ev.session_id))
+                    if (selected === ev) setSelected(null)
+                  }}
+                >✕</button>
               </div>
             )
           })}

@@ -558,6 +558,7 @@ pub struct SilenceResponse {
 
 #[derive(Serialize)]
 pub struct FocusTrailResponse {
+    pub session_id: String,
     pub node_id: String,
     pub content_preview: String,
     pub timestamp: String,
@@ -1533,6 +1534,115 @@ async fn get_node(
     Ok(Json(node_to_response(node)))
 }
 
+// ── Attachments ────────────────────────────────────────────────────────────────
+
+fn attachment_dir(node_id: &str) -> PathBuf {
+    PathBuf::from(format!("data/attachments/{}", node_id))
+}
+
+#[derive(Serialize)]
+struct AttachmentEntry {
+    filename: String,
+    size: u64,
+    url: String,
+    is_image: bool,
+}
+
+async fn get_attachments(Path(id): Path<String>) -> impl IntoResponse {
+    let dir = attachment_dir(&id);
+    if !dir.exists() {
+        return Json(Vec::<AttachmentEntry>::new()).into_response();
+    }
+    let mut entries = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for entry in rd.flatten() {
+            let filename = entry.file_name().to_string_lossy().to_string();
+            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            let ext = filename.rsplit('.').next().unwrap_or("").to_lowercase();
+            let is_image = matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg");
+            entries.push(AttachmentEntry {
+                url: format!("/api/nodes/{}/attachments/{}", id, filename),
+                filename,
+                size,
+                is_image,
+            });
+        }
+    }
+    entries.sort_by(|a, b| a.filename.cmp(&b.filename));
+    Json(entries).into_response()
+}
+
+async fn post_attachment(
+    Path(id): Path<String>,
+    mut multipart: axum::extract::Multipart,
+) -> impl IntoResponse {
+    let dir = attachment_dir(&id);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return (StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()}))).into_response();
+    }
+    let mut saved = Vec::new();
+    while let Ok(Some(field)) = multipart.next_field().await {
+        let filename = match field.file_name().map(str::to_string) {
+            Some(f) if !f.is_empty() => f,
+            _ => continue,
+        };
+        let safe_name: String = filename.chars()
+            .map(|c| if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
+            .collect();
+        let path = dir.join(&safe_name);
+        match field.bytes().await {
+            Ok(data) => {
+                if let Err(e) = std::fs::write(&path, &data) {
+                    return (StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": e.to_string()}))).into_response();
+                }
+                saved.push(safe_name);
+            }
+            Err(e) => return (StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+        }
+    }
+    Json(serde_json::json!({"uploaded": saved})).into_response()
+}
+
+async fn delete_attachment(Path((id, filename)): Path<(String, String)>) -> impl IntoResponse {
+    let safe: String = filename.chars()
+        .map(|c| if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    let path = attachment_dir(&id).join(&safe);
+    if path.exists() {
+        let _ = std::fs::remove_file(&path);
+        Json(serde_json::json!({"deleted": safe})).into_response()
+    } else {
+        (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "not found"}))).into_response()
+    }
+}
+
+async fn serve_attachment(Path((id, filename)): Path<(String, String)>) -> impl IntoResponse {
+    let safe: String = filename.chars()
+        .map(|c| if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    let path = attachment_dir(&id).join(&safe);
+    match std::fs::read(&path) {
+        Ok(data) => {
+            let ext = safe.rsplit('.').next().unwrap_or("").to_lowercase();
+            let mime = match ext.as_str() {
+                "png"  => "image/png",
+                "jpg" | "jpeg" => "image/jpeg",
+                "gif"  => "image/gif",
+                "webp" => "image/webp",
+                "svg"  => "image/svg+xml",
+                "pdf"  => "application/pdf",
+                "mp4"  => "video/mp4",
+                _      => "application/octet-stream",
+            };
+            ([(axum::http::header::CONTENT_TYPE, mime)], data).into_response()
+        }
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 async fn delete_node(
     State(app): State<AppState>,
     Path(id): Path<String>,
@@ -1596,6 +1706,26 @@ async fn put_node(
         .get_node(node_id)
         .ok_or_else(|| ApiError("node not found".into(), StatusCode::NOT_FOUND))?;
     Ok(Json(node_to_response(updated)))
+}
+
+async fn delete_focus_session(
+    State(app): State<AppState>,
+    Path(session_id): Path<String>,
+) -> impl IntoResponse {
+    let sid = match Uuid::parse_str(&session_id) {
+        Ok(id) => id,
+        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"invalid UUID"}))).into_response(),
+    };
+    let (found, snapshot) = {
+        let mut ws = app.workspace.write().await;
+        let found = ws.remove_focus_session(sid);
+        (found, ws.snapshot())
+    };
+    if !found {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error":"session not found"}))).into_response();
+    }
+    let _ = save_current_snapshot(&app, snapshot, "focus-delete").await;
+    Json(serde_json::json!({"deleted": session_id})).into_response()
 }
 
 async fn post_focus(
@@ -2467,7 +2597,17 @@ async fn get_souls(State(ws): State<SharedWorkspace>) -> impl IntoResponse {
             let preview = ws
                 .graph
                 .get_node(s.project_id)
-                .map(|n| n.content.chars().take(40).collect::<String>())
+                .map(|n| {
+                    let nick = n.metadata.get("nickname")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty());
+                    if let Some(name) = nick {
+                        name.to_string()
+                    } else {
+                        n.content.lines().next().unwrap_or("").chars().take(40).collect()
+                    }
+                })
                 .unwrap_or_default();
             let particle = match s.particle_style {
                 ParticleStyle::Aggressive => "aggressive",
@@ -2572,6 +2712,7 @@ async fn get_trail(
                 .unwrap_or_default();
             let depth = format!("{:?}", ev.depth);
             FocusTrailResponse {
+                session_id: ev.session_id.to_string(),
                 node_id: ev.node_id.to_string(),
                 content_preview: preview,
                 timestamp: ev.timestamp.to_rfc3339(),
@@ -4630,6 +4771,8 @@ pub fn build_router(app: AppState) -> Router {
             get(get_node).delete(delete_node).put(put_node),
         )
         .route("/nodes/:id/related", get(get_related))
+        .route("/nodes/:id/attachments", get(get_attachments).post(post_attachment))
+        .route("/nodes/:id/attachments/:filename", axum::routing::delete(delete_attachment).get(serve_attachment))
         .route("/nodes/:id/void", axum::routing::post(post_void_toggle))
         .route("/nodes/:id/fossilize", axum::routing::post(post_fossilize))
         .route("/nodes/:id/excavate", axum::routing::post(post_excavate))
@@ -4639,6 +4782,7 @@ pub fn build_router(app: AppState) -> Router {
         // cognitive interaction
         .route("/thought", post(post_thought))
         .route("/focus", post(post_focus))
+        .route("/focus/:session_id", axum::routing::delete(delete_focus_session))
         .route("/journal", get(get_journal).post(post_journal))
         .route("/tasks", get(get_tasks).post(post_task))
         .route(

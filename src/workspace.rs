@@ -143,6 +143,10 @@ impl SilentNodeWorkspace {
         Ok(self.focus.record(node_id, duration_seconds, depth))
     }
 
+    pub fn remove_focus_session(&mut self, session_id: Uuid) -> bool {
+        self.focus.remove_session(session_id)
+    }
+
     pub fn add_journal_entry(
         &mut self,
         content: impl Into<String>,

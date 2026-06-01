@@ -338,6 +338,7 @@ export interface SilenceData {
 
 // ── Focus Trail ──────────────────────────────────────────────────────────────
 export interface TrailEvent {
+  session_id: string
   node_id: string
   content_preview: string
   timestamp: string
