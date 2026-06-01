@@ -4237,16 +4237,16 @@ async fn delete_vault(State(app): State<AppState>, Path(name): Path<String>) -> 
         )
             .into_response();
     }
-    let before = reg.vaults.len();
-    reg.vaults.retain(|v| v.name != name);
-    if reg.vaults.len() == before {
-        return (
+    let vault_path = match reg.vaults.iter().find(|v| v.name == name) {
+        Some(v) => PathBuf::from(&v.path),
+        None => return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "vault not found"})),
-        )
-            .into_response();
-    }
+        ).into_response(),
+    };
+    reg.vaults.retain(|v| v.name != name);
     reg.save();
+    let _ = std::fs::remove_file(&vault_path);
     Json(serde_json::json!({"deleted": name})).into_response()
 }
 

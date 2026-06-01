@@ -15,6 +15,7 @@ interface GNode {
   node_type: string
   custom_color?: string | null
   content: string
+  nickname?: string | null
   gravity: number
   entropy: number
   velocity: number
@@ -136,7 +137,7 @@ function rgbaToHex(c: [number, number, number, number]) {
 
 function makeGNode(n: SNode, soulColor?: string): GNode {
   return {
-    id: n.id, node_type: n.node_type, content: n.content,
+    id: n.id, node_type: n.node_type, content: n.content, nickname: n.nickname,
     custom_color: n.custom_color || (n.node_type === 'other' ? n.aura_color : undefined),
     gravity: n.gravity, entropy: n.entropy, velocity: n.velocity,
     is_ghost: n.is_ghost, is_fossil: n.is_fossil, is_void: n.is_void,
@@ -292,7 +293,7 @@ export default function Graph3D({ nodes, edges, selectedId, onSelect, dim, trail
         ref={fgRef}
         graphData={graphData}
         backgroundColor="rgba(0,0,0,0)"
-        nodeLabel={(n: object) => labelsEnabled ? (n as GNode).content : ''}
+        nodeLabel={(n: object) => { const g = n as GNode; if (!labelsEnabled) return ''; return g.nickname?.trim() || g.content.split('\n')[0].slice(0, 60) }}
         nodeThreeObject={nodeThreeObject}
         nodeThreeObjectExtend={false}
         linkColor={linkColor}
