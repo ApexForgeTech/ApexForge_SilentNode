@@ -5063,6 +5063,117 @@ pub async fn start_api_server(
         });
     }
 
+    // schedule notifier — fires every 60s, checks all node schedules and sends notifications
+    {
+        let sched_ws = shared.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+            let mut fired: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut interval_last: std::collections::HashMap<String, chrono::DateTime<chrono::Local>> =
+                std::collections::HashMap::new();
+            loop {
+                ticker.tick().await;
+                use chrono::Datelike;
+                let now = chrono::Local::now();
+                let current_hhmm = now.format("%H:%M").to_string();
+                let current_date = now.format("%Y-%m-%d").to_string();
+                let current_weekday = now.weekday().num_days_from_sunday() as u8;
+
+                let settings = load_notification_settings();
+                let channel = settings.default_channel.as_str();
+                let send_telegram = settings.telegram_enabled
+                    && (channel == "telegram" || channel == "both");
+
+                fired.retain(|k| k.ends_with(&current_hhmm));
+
+                struct SchedInfo {
+                    id: String,
+                    content: String,
+                    mode: String,
+                    time_of_day: Option<String>,
+                    days: Vec<u8>,
+                    interval_minutes: Option<u32>,
+                    start_at: Option<String>,
+                    end_at: Option<String>,
+                }
+
+                let nodes: Vec<SchedInfo> = {
+                    let ws = sched_ws.read().await;
+                    ws.graph.nodes().filter_map(|n| {
+                        let sched = n.metadata.get("schedule")?.as_object()?;
+                        let mode = sched.get("mode")?.as_str()?.to_string();
+                        if mode == "none" { return None; }
+                        let status = sched.get("status").and_then(|v| v.as_str()).unwrap_or("active");
+                        if status != "active" { return None; }
+                        Some(SchedInfo {
+                            id: n.id.to_string(),
+                            content: n.content.clone(),
+                            mode,
+                            time_of_day: sched.get("time_of_day").and_then(|v| v.as_str()).map(str::to_string),
+                            days: sched.get("days_of_week")
+                                .and_then(|v| v.as_array())
+                                .map(|arr| arr.iter().filter_map(|x| x.as_u64().map(|d| d as u8)).collect())
+                                .unwrap_or_default(),
+                            interval_minutes: sched.get("interval_minutes").and_then(|v| v.as_u64()).map(|v| v as u32),
+                            start_at: sched.get("start_at").and_then(|v| v.as_str()).map(str::to_string),
+                            end_at: sched.get("end_at").and_then(|v| v.as_str()).map(str::to_string),
+                        })
+                    }).collect()
+                };
+
+                for info in nodes {
+                    let fire_key = format!("{}_{}", info.id, current_hhmm);
+                    if fired.contains(&fire_key) { continue; }
+
+                    if let Some(ref end) = info.end_at {
+                        if !end.is_empty() && current_date.as_str() > end.as_str() { continue; }
+                    }
+                    if let Some(ref start) = info.start_at {
+                        if !start.is_empty() && current_date.as_str() < start.as_str() { continue; }
+                    }
+
+                    let time_matches = info.time_of_day.as_deref().map(str::trim) == Some(current_hhmm.as_str());
+
+                    let should_fire = match info.mode.as_str() {
+                        "daily" | "once" => time_matches,
+                        "weekly" | "custom_days" => time_matches && info.days.contains(&current_weekday),
+                        "interval" => {
+                            if let Some(interval) = info.interval_minutes.filter(|&v| v > 0) {
+                                let last = interval_last.get(&info.id).copied()
+                                    .unwrap_or(now - chrono::Duration::days(1));
+                                (now - last).num_minutes() >= interval as i64
+                            } else {
+                                false
+                            }
+                        }
+                        _ => false,
+                    };
+
+                    if !should_fire { continue; }
+
+                    let label = info.content.lines().next().unwrap_or("Node reminder").to_string();
+                    let msg = format!("SilentNode ⏰ {label}");
+
+                    if send_telegram {
+                        match send_telegram_notification(&settings, &msg).await {
+                            Ok(()) => {
+                                println!("[scheduler] notified {} at {}", info.id, current_hhmm);
+                                fired.insert(fire_key);
+                                if info.mode == "interval" {
+                                    interval_last.insert(info.id, now);
+                                }
+                            }
+                            Err(e) => eprintln!("[scheduler] telegram failed for {}: {}", info.id, e.0),
+                        }
+                    } else {
+                        println!("[scheduler] app-channel due: {} at {}", info.id, current_hhmm);
+                        fired.insert(fire_key);
+                    }
+                }
+            }
+        });
+    }
+
     let router = build_router(app_state);
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     println!("[api] Listening on http://{addr}");
