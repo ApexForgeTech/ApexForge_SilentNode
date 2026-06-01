@@ -1,0 +1,76 @@
+# Rust
+/target
+Cargo.lock
+
+# Web
+web/node_modules/
+web/dist/
+
+# Data / DB
+data/*.sqlite
+data/*.sqlite-journal
+data/*.sqlite-shm
+data/*.sqlite-wal
+data/*.local.json
+data/*.enc
+data/*.html
+data/vaults.json
+data/vault/
+data/silentnode.surkv/
+*.sqlite
+*.db
+
+# Env / secrets
+.env
+.env.*
+*.key
+*.pem
+*.secret
+*.token
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+ctd/
+
+# ML models (trained artifacts — regenerate with trainer)
+data/ml_models/
+data/ml_models/*.pkl
+data/ml_models/*.pt
+data/ml_models/*.onnx
+data/ml_models/status.json
+
+# Local assistant / machine state
+.claude/
+.codex/
+ctd/
+# Screenshots / throwaway captures
+screenshot_*.png
