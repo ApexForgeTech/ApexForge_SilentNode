@@ -185,6 +185,16 @@ export interface DreamProposal {
   kind: string
   confidence: number
   description: string
+  rationale: string
+  action_label?: string
+  risk: 'low' | 'medium' | 'high' | string
+  from?: string
+  to?: string
+  node_id?: string
+  a?: string
+  b?: string
+  similarity?: number
+  entropy?: number
 }
 
 // ── New types (missing endpoints) ────────────────────────────────────────────
@@ -315,6 +325,13 @@ export interface WeatherData {
   color_g: number
   color_b: number
   description: string
+  avg_entropy: number
+  ghost_ratio: number
+  recent_focus_hours: number
+  weighted_focus_hours: number
+  trail_density: number
+  exploration: number
+  deep_ratio: number
 }
 
 // ── Souls ────────────────────────────────────────────────────────────────────

@@ -4,7 +4,7 @@
 
 use crate::intelligence::SuggestionEngine;
 use crate::workspace::SilentNodeWorkspace;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 // ── Proposal types ────────────────────────────────────────────────────────────
@@ -31,6 +31,26 @@ pub struct DreamProposal {
     pub kind: ProposalKind,
     pub confidence: f32,
     pub description: String,
+    pub rationale: String,
+    pub action_label: Option<String>,
+    pub risk: ProposalRisk,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProposalRisk {
+    Low,
+    Medium,
+    High,
+}
+
+impl ProposalRisk {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
 }
 
 // ── Engine ────────────────────────────────────────────────────────────────────
@@ -105,6 +125,10 @@ impl DreamEngine {
                     id: Uuid::new_v4(),
                     confidence: r.similarity,
                     description: format!("Connect «{fl}» ↔ «{tl}»  sim={:.2}", r.similarity),
+                    rationale: "High text similarity and no existing edge between these nodes."
+                        .into(),
+                    action_label: Some("Create link".into()),
+                    risk: ProposalRisk::Low,
                     kind: ProposalKind::SuggestEdge {
                         from: id,
                         to: r.node_id,
@@ -148,6 +172,13 @@ impl DreamEngine {
                 id: Uuid::new_v4(),
                 confidence,
                 description: format!("Revive «{label}»  {active_neighbors} active neighbors"),
+                rationale: format!(
+                    "Ghost still has gravity {:.2} and {active_neighbors} active neighbor{}.",
+                    ghost.gravity,
+                    if active_neighbors == 1 { "" } else { "s" }
+                ),
+                action_label: Some("Revive node".into()),
+                risk: ProposalRisk::Low,
                 kind: ProposalKind::ReviveGhost { node_id: ghost_id },
             });
         }
@@ -182,10 +213,20 @@ impl DreamEngine {
                 let al = clip(a_label, 18);
                 let bl = clip(b_label, 18);
 
+                if workspace.graph.get_edge(id, r.node_id).is_some()
+                    || workspace.graph.get_edge(r.node_id, id).is_some()
+                {
+                    continue;
+                }
+
                 out.push(DreamProposal {
                     id: Uuid::new_v4(),
                     confidence: r.similarity,
                     description: format!("Merge «{al}» + «{bl}»  sim={:.2}", r.similarity),
+                    rationale: "Near-duplicate text. Automatic destructive merge is not applied; the safe action creates a strong resonance link for later review."
+                        .into(),
+                    action_label: Some("Link for review".into()),
+                    risk: ProposalRisk::Medium,
                     kind: ProposalKind::MergeNodes {
                         a: id,
                         b: r.node_id,
@@ -201,15 +242,41 @@ impl DreamEngine {
         workspace: &SilentNodeWorkspace,
         out: &mut Vec<DreamProposal>,
     ) {
+        let active_ids: HashSet<Uuid> = workspace
+            .focus
+            .active_nodes_since(chrono::Utc::now() - chrono::Duration::hours(24))
+            .into_iter()
+            .collect();
+        let degree_by_id: HashMap<Uuid, usize> = workspace
+            .graph
+            .node_ids()
+            .into_iter()
+            .map(|id| (id, workspace.graph.degree(id)))
+            .collect();
+
         for node in workspace.graph.nodes() {
             if node.entropy < 0.75 {
                 continue;
             }
+            if node.is_void || node.is_fossil {
+                continue;
+            }
+            let activity_boost = if active_ids.contains(&node.id) { 0.10 } else { 0.0 };
+            let isolation_boost = if degree_by_id.get(&node.id).copied().unwrap_or(0) == 0 {
+                0.08
+            } else {
+                0.0
+            };
+            let confidence = (node.entropy + activity_boost + isolation_boost).clamp(0.0, 1.0);
             let label = clip(&node.content, 25);
             out.push(DreamProposal {
                 id: Uuid::new_v4(),
-                confidence: node.entropy,
+                confidence,
                 description: format!("High entropy «{label}»  η={:.2}", node.entropy),
+                rationale: "Entropy is high; stabilizing will lower drift and mark the node as recently handled."
+                    .into(),
+                action_label: Some("Stabilize".into()),
+                risk: ProposalRisk::Low,
                 kind: ProposalKind::EntropyAlert {
                     node_id: node.id,
                     entropy: node.entropy,
@@ -226,9 +293,14 @@ impl Default for DreamEngine {
 }
 
 fn clip(s: &str, max: usize) -> &str {
-    if s.len() <= max {
+    if s.chars().count() <= max {
         s
     } else {
-        &s[..max]
+        let end = s
+            .char_indices()
+            .nth(max)
+            .map(|(idx, _)| idx)
+            .unwrap_or(s.len());
+        &s[..end]
     }
 }

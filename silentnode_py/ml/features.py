@@ -155,6 +155,7 @@ def _load_nodes_from(db_path: str) -> List[Dict]:
             metadata = json.loads(r.get("metadata_json") or "{}")
         except Exception:
             metadata = {}
+        r["metadata"] = metadata
         nickname = str(metadata.get("nickname") or "").strip()
         r["nickname"] = nickname
         # Type classification should describe the node's own text. Neighbor

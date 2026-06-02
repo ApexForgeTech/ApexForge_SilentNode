@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect } from 'react'
 import type { WeatherData } from '../types'
 import { api } from '../api'
 
@@ -97,6 +97,14 @@ export default function WeatherView() {
   const g = Math.round(weather.color_g * 255)
   const b = Math.round(weather.color_b * 255)
   const descs = STATE_DESCS[weather.state] ?? []
+  const metrics = [
+    ['Entropy', weather.avg_entropy, 'Average node drift'],
+    ['Ghosts', weather.ghost_ratio, 'Dormant node pressure'],
+    ['Focus', Math.min(weather.recent_focus_hours / 4, 1), `${weather.recent_focus_hours.toFixed(1)}h last 24h`],
+    ['Weighted', Math.min(weather.weighted_focus_hours / 3, 1), `${weather.weighted_focus_hours.toFixed(1)}h depth-weighted`],
+    ['Exploration', weather.exploration, 'Unique nodes touched'],
+    ['Deep work', weather.deep_ratio, 'Deep work share'],
+  ] as const
 
   return (
     <div className="col" style={{ height:'100%', gap:12, padding:4 }}>
@@ -154,34 +162,27 @@ export default function WeatherView() {
         </div>
       </div>
 
-      {/* All states reference */}
+      {/* Live signal breakdown */}
       <div className="panel fill scroll">
         <div className="sec-head">
           <span style={{ color:'var(--t3)' }}>◐</span>
-          All Weather States
+          Live Signals
         </div>
-        <div style={{ padding:'8px 0' }}>
-          {Object.entries(STATE_ICONS).map(([state, icon]) => {
-            const isActive = state === weather.state
+        <div style={{ padding:'10px 14px', display:'flex', flexDirection:'column', gap:10 }}>
+          {metrics.map(([label, value, detail]) => {
+            const pct = Math.max(0, Math.min(value, 1))
             return (
-              <div key={state} style={{
-                padding:'8px 14px',
-                borderBottom:'1px solid rgba(255,255,255,0.04)',
-                background: isActive ? `rgba(${r},${g},${b},0.06)` : 'transparent',
-                borderLeft: isActive ? `2px solid rgba(${r},${g},${b},0.4)` : '2px solid transparent',
-              }}>
-                <div style={{ display:'flex', gap:8, alignItems:'center', marginBottom:4 }}>
-                  <span style={{ fontSize:14 }}>{icon}</span>
-                  <span style={{
-                    fontSize:12, fontWeight:600,
-                    color: isActive ? `rgb(${r},${g},${b})` : 'var(--t2)',
-                  }}>
-                    {state}
-                    {isActive && <span style={{ fontSize:10, marginLeft:8, opacity:0.7 }}>← current</span>}
-                  </span>
+              <div key={label}>
+                <div style={{ display:'flex', alignItems:'baseline', justifyContent:'space-between', marginBottom:5 }}>
+                  <span style={{ color:'var(--t2)', fontSize:12, fontWeight:600 }}>{label}</span>
+                  <span style={{ color:'var(--t4)', fontSize:10 }}>{detail}</span>
                 </div>
-                <div style={{ color:'var(--t4)', fontSize:11, lineHeight:1.4 }}>
-                  {STATE_DESCS[state]?.[0]}
+                <div className="bar">
+                  <div className="bar-fill" style={{
+                    width:`${(pct * 100).toFixed(0)}%`,
+                    background:`rgb(${r},${g},${b})`,
+                    opacity:0.85,
+                  }} />
                 </div>
               </div>
             )

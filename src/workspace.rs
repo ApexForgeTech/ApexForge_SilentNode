@@ -140,6 +140,11 @@ impl SilentNodeWorkspace {
         depth: FocusDepth,
     ) -> Result<FocusEvent, GraphError> {
         self.graph.touch_node(node_id, Utc::now())?;
+        let duration_seconds = if duration_seconds.is_finite() && duration_seconds > 0.0 {
+            duration_seconds
+        } else {
+            1.0
+        };
         Ok(self.focus.record(node_id, duration_seconds, depth))
     }
 
@@ -767,7 +772,7 @@ impl SilentNodeWorkspace {
         if self.graph.get_node(node_id).is_none() {
             return Err(GraphError::NodeNotFound(node_id));
         }
-        self.record_focus(node_id, 0.0, crate::domain::FocusDepth::DeepWork)?;
+        self.record_focus(node_id, 1.0, crate::domain::FocusDepth::DeepWork)?;
         if let Some(node) = self.graph.get_node(node_id) {
             self.temporal
                 .record_change(node, crate::domain::ChangeType::Accessed);

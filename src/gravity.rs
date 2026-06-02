@@ -172,8 +172,33 @@ impl GravityEngine {
                     (chrono::Utc::now() - node.accessed_at).num_seconds().max(0) as f32 / 86_400.0;
                 let recency_score = 1.0 / (1.0 + recency_days);
                 let focus_score = focus_heatmap.get(&node_id).copied().unwrap_or(0.0);
-                node.gravity =
-                    1.0 + node.access_count as f32 * 0.2 + degree + recency_score + focus_score;
+                let access_score = (node.access_count as f32).ln_1p().min(4.0) * 0.35;
+                let degree_score = degree.sqrt().min(4.0) * 0.55;
+                let type_bias = match node.node_type {
+                    crate::domain::NodeType::Project | crate::domain::NodeType::World => 0.35,
+                    crate::domain::NodeType::Process => 0.25,
+                    crate::domain::NodeType::Artifact | crate::domain::NodeType::Media => 0.10,
+                    crate::domain::NodeType::Ghost
+                    | crate::domain::NodeType::Fossil
+                    | crate::domain::NodeType::Other => 0.0,
+                    _ => 0.15,
+                };
+                let state_penalty = if node.is_void || node.is_fossil {
+                    -0.8
+                } else if node.is_ghost {
+                    -0.35
+                } else {
+                    0.0
+                };
+                let target_gravity = (1.0
+                    + access_score
+                    + degree_score
+                    + recency_score * 0.45
+                    + focus_score * 1.25
+                    + type_bias
+                    + state_penalty)
+                    .clamp(0.25, 8.0);
+                node.gravity = (node.gravity * 0.70 + target_gravity * 0.30).clamp(0.25, 8.0);
             }
         }
     }

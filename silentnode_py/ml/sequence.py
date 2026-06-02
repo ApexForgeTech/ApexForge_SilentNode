@@ -20,7 +20,14 @@ from typing import List, Dict, Optional
 from collections import defaultdict
 from datetime import datetime, timezone
 
-from .features import load_nodes, load_focus_events, DB_PATH
+from .features import (
+    load_nodes,
+    load_focus_events,
+    load_edges,
+    node_focus_stats,
+    build_text_tokens,
+    DB_PATH,
+)
 
 MODEL_DIR = Path("data/ml_models")
 SEQUENCE_PATH = MODEL_DIR / "sequence_model.pkl"
@@ -56,11 +63,29 @@ class MarkovSequenceModel:
         }
         self.node_access_count: Dict[str, int] = {}
         self.node_info: Dict[str, Dict] = {}
+        self.node_order: List[str] = []
+        self.focus_stats: Dict[str, Dict] = {}
+        self.graph_links: Dict[str, Dict[str, float]] = {}
         self.trained = False
         self.n_transitions = 0
         self.n_transitions2 = 0
         self.n_unique_nodes = 0
         self.version: int = 0
+
+    def _reset_learned_state(self):
+        """Clear train-derived state while preserving the model version."""
+        self.transitions = {}
+        self.transitions2 = {}
+        self.hour_transitions = {b: {} for b in range(4)}
+        self.node_access_count = {}
+        self.node_info = {}
+        self.node_order = []
+        self.focus_stats = {}
+        self.graph_links = {}
+        self.trained = False
+        self.n_transitions = 0
+        self.n_transitions2 = 0
+        self.n_unique_nodes = 0
 
     # ------------------------------------------------------------------
     # Training
@@ -73,15 +98,28 @@ class MarkovSequenceModel:
         consecutive distinct node visits build first- and second-order
         transition tables.
         """
+        self._reset_learned_state()
         nodes  = load_nodes(db_path)
         events = load_focus_events(db_path)
+        edges  = load_edges(db_path)
+        self.focus_stats = node_focus_stats(nodes, events)
+        self.node_order = [n["id"] for n in nodes]
 
         # Store node metadata
         for n in nodes:
             self.node_info[n["id"]] = {
                 "content":   n["content"][:60],
                 "node_type": n["node_type"],
+                "nickname":  n.get("nickname", ""),
+                "metadata":  n.get("metadata", {}) or {},
+                "entropy":   float(n.get("entropy") or 0.0),
+                "gravity":   float(n.get("gravity") or 1.0),
+                "velocity":  float(n.get("velocity") or 0.0),
+                "is_ghost":  bool(n.get("is_ghost")),
+                "is_fossil": bool(n.get("is_fossil")),
+                "is_void":   bool(n.get("is_void")),
             }
+        self.graph_links = self._build_graph_links(edges)
 
         events_sorted = sorted(events, key=lambda e: e["ts_float"])
         for ev in events_sorted:
@@ -90,8 +128,12 @@ class MarkovSequenceModel:
 
         if len(events_sorted) < 2:
             self.n_unique_nodes = len(self.node_access_count)
+            self.trained = True
+            self.version += 1
+            self.save()
             return {
                 "status":   "insufficient_data",
+                "version":  self.version,
                 "n_events": len(events_sorted),
                 "message":  "Need at least 2 focus events to learn sequences",
             }
@@ -167,6 +209,175 @@ class MarkovSequenceModel:
     # Prediction helpers
     # ------------------------------------------------------------------
 
+    def _build_graph_links(self, edges: List[Dict]) -> Dict[str, Dict[str, float]]:
+        """Directed adjacency plus sibling hints used for contextual fallback."""
+        links: Dict[str, Dict[str, float]] = defaultdict(dict)
+        children_by_parent: Dict[str, List[tuple]] = defaultdict(list)
+        for edge in edges:
+            src = edge.get("source_id")
+            dst = edge.get("target_id")
+            if not src or not dst:
+                continue
+            try:
+                weight = float(edge.get("weight") or 1.0)
+            except Exception:
+                weight = 1.0
+            weight = max(0.05, min(weight, 5.0))
+            links[src][dst] = max(links[src].get(dst, 0.0), weight)
+            links[dst][src] = max(links[dst].get(src, 0.0), weight * 0.25)
+            children_by_parent[src].append((dst, weight))
+
+        # Parent/root nodes often connect a routine group. From a child node,
+        # siblings are usually a better "next focus" than jumping back to the
+        # broad parent hub, so add a moderate sibling signal.
+        for children in children_by_parent.values():
+            if len(children) < 2:
+                continue
+            for src, src_weight in children:
+                for dst, dst_weight in children:
+                    if src == dst:
+                        continue
+                    sibling_weight = min(src_weight, dst_weight) * 0.55
+                    links[src][dst] = max(links[src].get(dst, 0.0), sibling_weight)
+        return dict(links)
+
+    def _node_tokens(self, node_id: str) -> set:
+        info = self.node_info.get(node_id, {})
+        text = f"{info.get('nickname', '')} {info.get('content', '')}"
+        return set(build_text_tokens(text))
+
+    def _text_similarity(self, current_id: Optional[str], candidate_id: str) -> float:
+        if not current_id or current_id not in self.node_info:
+            return 0.0
+        a = self._node_tokens(current_id)
+        b = self._node_tokens(candidate_id)
+        if not a or not b:
+            return 0.0
+        return len(a & b) / max(len(a | b), 1)
+
+    def _schedule_boost(self, node_id: str) -> float:
+        sched = self.node_info.get(node_id, {}).get("metadata", {}).get("schedule") or {}
+        if not isinstance(sched, dict) or sched.get("status", "active") != "active":
+            return 0.0
+        mode = str(sched.get("mode") or "").lower()
+        if mode in {"daily", "custom_days", "weekly"}:
+            return 0.35
+        if mode == "interval":
+            return 0.25
+        if mode == "once":
+            return 0.18
+        return 0.0
+
+    def _candidate_reason(self, current_id: Optional[str], node_id: str, parts: Dict[str, float]) -> str:
+        labels = []
+        if parts.get("transition", 0.0) > 0:
+            labels.append("learned sequence")
+        if parts.get("graph", 0.0) > 0.05:
+            labels.append("linked in graph")
+        if parts.get("text", 0.0) > 0.08:
+            labels.append("similar content")
+        if parts.get("schedule", 0.0) > 0:
+            labels.append("scheduled routine")
+        if parts.get("neglect", 0.0) > 0.25:
+            labels.append("needs attention")
+        if parts.get("focus_gap", 0.0) > 0.2:
+            labels.append("little focus logged")
+        if current_id and current_id not in self.node_info:
+            labels.append("popular fallback")
+        return ", ".join(labels[:3]) or "contextual next focus"
+
+    def _contextual_scores(
+        self,
+        current_node_id: Optional[str],
+        transition_scores: Optional[Dict[str, float]] = None,
+        exclude: Optional[set] = None,
+    ) -> List[tuple]:
+        """Rank candidates when direct sequence data is sparse.
+
+        This deliberately blends several weak signals instead of letting the
+        global most-focused node dominate every private vault.
+        """
+        transition_scores = transition_scores or {}
+        exclude = exclude or set()
+        max_access = max(self.node_access_count.values(), default=1)
+        current_links = self.graph_links.get(current_node_id or "", {})
+        max_link = max(current_links.values(), default=1.0)
+
+        rows = []
+        for node_id in self.node_order:
+            if node_id in exclude:
+                continue
+            info = self.node_info.get(node_id, {})
+            if info.get("is_ghost") or info.get("is_fossil") or info.get("is_void"):
+                continue
+
+            focus = self.focus_stats.get(node_id, {})
+            total_seconds = float(focus.get("total_seconds", 0.0))
+            last_days = float(focus.get("last_focus_days", 30.0))
+            access_count = float(self.node_access_count.get(node_id, 0))
+
+            graph = current_links.get(node_id, 0.0) / max_link if current_links else 0.0
+            text = self._text_similarity(current_node_id, node_id)
+            schedule = self._schedule_boost(node_id)
+            neglect = min(last_days / 14.0, 1.0)
+            focus_gap = 1.0 if total_seconds <= 0 else max(0.0, 1.0 - total_seconds / 7200.0)
+            access = access_count / max_access if max_access else 0.0
+            gravity = min(float(info.get("gravity") or 1.0) / 5.0, 1.0)
+            entropy = min(float(info.get("entropy") or 0.0), 1.0)
+            transition = transition_scores.get(node_id, 0.0)
+
+            parts = {
+                "transition": transition,
+                "graph": graph,
+                "text": text,
+                "schedule": schedule,
+                "neglect": neglect,
+                "focus_gap": focus_gap,
+                "access": access,
+                "gravity": gravity,
+                "entropy": entropy,
+            }
+            score = (
+                transition * 0.42
+                + graph * 0.18
+                + text * 0.16
+                + schedule * 0.12
+                + neglect * 0.07
+                + focus_gap * 0.06
+                + access * 0.04
+                + gravity * 0.03
+                + entropy * 0.02
+            )
+            if score <= 0:
+                continue
+            rows.append((node_id, score, parts))
+
+        rows.sort(key=lambda item: item[1], reverse=True)
+        return rows
+
+    def _ranked_results(
+        self,
+        rows: List[tuple],
+        top_k: int,
+        source: str,
+        current_node_id: Optional[str] = None,
+    ) -> List[Dict]:
+        rows = rows[:max(0, top_k)]
+        total = sum(score for _, score, _ in rows) or 1.0
+        results = []
+        for node_id, score, parts in rows:
+            info = self.node_info.get(node_id, {"content": node_id[:16], "node_type": "idea"})
+            results.append({
+                "node_id":     node_id,
+                "content":     info["content"],
+                "node_type":   info["node_type"],
+                "probability": round(max(0.0, min(score / total, 1.0)), 4),
+                "score":       round(score, 4),
+                "source":      source,
+                "reason":      self._candidate_reason(current_node_id, node_id, parts),
+            })
+        return results
+
     def _probs_from_counts(self, counts: Dict[str, int],
                            top_k: int) -> List[Dict]:
         """Convert a {node_id: count} dict into a ranked probability list."""
@@ -219,11 +430,11 @@ class MarkovSequenceModel:
         Applies optional time-of-day weighting.
         """
         if not self.trained:
-            return self._fallback_popular(top_k, exclude={current_node_id})
+            return self._contextual_fallback(top_k, current_node_id, exclude={current_node_id})
 
         counts = self.transitions.get(current_node_id, {})
         if not counts:
-            return self._fallback_popular(top_k, exclude={current_node_id})
+            return self._contextual_fallback(top_k, current_node_id, exclude={current_node_id})
 
         # Convert to float scores for optional boosting
         total = sum(counts.values()) or 1
@@ -238,18 +449,12 @@ class MarkovSequenceModel:
                 pass
 
         # Re-rank by boosted scores
-        ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
-        results = []
-        for node_id, score in ranked:
-            info = self.node_info.get(node_id,
-                                       {"content": node_id[:16], "node_type": "idea"})
-            results.append({
-                "node_id":     node_id,
-                "content":     info["content"],
-                "node_type":   info["node_type"],
-                "probability": round(min(score, 1.0), 4),
-            })
-        return results
+        rows = self._contextual_scores(
+            current_node_id,
+            transition_scores=scores,
+            exclude={current_node_id},
+        )
+        return self._ranked_results(rows, top_k, "sequence_context", current_node_id)
 
     def session_recommendations(self, recent_node_ids: List[str],
                                  top_k: int = 5,
@@ -271,7 +476,7 @@ class MarkovSequenceModel:
             List of recommendation dicts sorted by score descending.
         """
         if not self.trained or not recent_node_ids:
-            return self._fallback_popular(top_k)
+            return self._contextual_fallback(top_k)
 
         scores: Dict[str, float] = defaultdict(float)
 
@@ -303,23 +508,29 @@ class MarkovSequenceModel:
 
         # Exclude nodes already in the session
         session_set = set(recent_node_ids)
-        results = []
-        for node_id, score in sorted(scores.items(),
-                                      key=lambda x: x[1], reverse=True):
-            if node_id in session_set:
-                continue
-            info = self.node_info.get(node_id,
-                                       {"content": node_id[:16], "node_type": "idea"})
-            results.append({
-                "node_id":     node_id,
-                "content":     info["content"],
-                "node_type":   info["node_type"],
-                "probability": round(min(score, 1.0), 4),
-            })
-            if len(results) >= top_k:
-                break
+        rows = self._contextual_scores(
+            recent_node_ids[-1] if recent_node_ids else None,
+            transition_scores=dict(scores),
+            exclude=session_set,
+        )
+        current_id = recent_node_ids[-1] if recent_node_ids else None
+        return (
+            self._ranked_results(rows, top_k, "session_context", current_id)
+            if rows
+            else self._contextual_fallback(top_k, current_id, exclude=session_set)
+        )
 
-        return results if results else self._fallback_popular(top_k, exclude=session_set)
+    def _contextual_fallback(
+        self,
+        top_k: int,
+        current_node_id: Optional[str] = None,
+        exclude: Optional[set] = None,
+    ) -> List[Dict]:
+        exclude = exclude or set()
+        rows = self._contextual_scores(current_node_id, exclude=exclude)
+        if rows:
+            return self._ranked_results(rows, top_k, "contextual_fallback", current_node_id)
+        return self._fallback_popular(top_k, exclude=exclude)
 
     def _fallback_popular(self, top_k: int, exclude: Optional[set] = None) -> List[Dict]:
         """Return the globally most-accessed nodes as a fallback."""
@@ -340,6 +551,8 @@ class MarkovSequenceModel:
                 "node_type":   info["node_type"],
                 "probability": round(cnt / total, 4),
                 "count":       cnt,
+                "source":      "popular_fallback",
+                "reason":      "popular fallback",
             })
         return results
 

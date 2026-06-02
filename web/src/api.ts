@@ -139,6 +139,9 @@ export const api = {
   dreamProposals: (): Promise<DreamProposal[]> =>
     request('/dream/proposals'),
 
+  applyDreamProposal: (proposal: DreamProposal): Promise<{ applied: boolean; action: string; message: string }> =>
+    request('/dream/apply', { method: 'POST', body: JSON.stringify(proposal) }),
+
   synthesize: (query: string): Promise<{ narrative: string; related_nodes: string[] }> =>
     request('/synthesize', { method: 'POST', body: JSON.stringify({ query }) }),
 

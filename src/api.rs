@@ -401,6 +401,34 @@ pub struct ProposalResponse {
     pub kind: String,
     pub confidence: f32,
     pub description: String,
+    pub rationale: String,
+    pub action_label: Option<String>,
+    pub risk: String,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub node_id: Option<String>,
+    pub a: Option<String>,
+    pub b: Option<String>,
+    pub similarity: Option<f32>,
+    pub entropy: Option<f32>,
+}
+
+#[derive(Deserialize)]
+pub struct DreamActionRequest {
+    pub kind: String,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub node_id: Option<String>,
+    pub a: Option<String>,
+    pub b: Option<String>,
+    pub similarity: Option<f32>,
+}
+
+#[derive(Serialize)]
+pub struct DreamActionResponse {
+    pub applied: bool,
+    pub action: String,
+    pub message: String,
 }
 
 #[derive(Serialize)]
@@ -557,6 +585,13 @@ pub struct WeatherResponse {
     pub color_g: f32,
     pub color_b: f32,
     pub description: String,
+    pub avg_entropy: f32,
+    pub ghost_ratio: f32,
+    pub recent_focus_hours: f32,
+    pub weighted_focus_hours: f32,
+    pub trail_density: f32,
+    pub exploration: f32,
+    pub deep_ratio: f32,
 }
 
 #[derive(Serialize)]
@@ -1368,7 +1403,7 @@ fn set_node_schedule(
             ))
         }
     };
-    let days = schedule
+    let mut days = schedule
         .days_of_week
         .unwrap_or_default()
         .into_iter()
@@ -1376,12 +1411,17 @@ fn set_node_schedule(
         .collect::<HashSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
+    days.sort_unstable();
     let days = days
         .into_iter()
         .map(serde_json::Value::from)
         .collect::<Vec<_>>();
     let mut map = serde_json::Map::new();
-    map.insert("mode".into(), serde_json::Value::String(mode));
+    let needs_time = matches!(mode.as_str(), "once" | "daily" | "weekly" | "custom_days");
+    let needs_days = matches!(mode.as_str(), "weekly" | "custom_days");
+    let needs_interval = mode == "interval";
+    let days_empty = days.is_empty();
+    map.insert("mode".into(), serde_json::Value::String(mode.clone()));
     map.insert("status".into(), serde_json::Value::String(status));
     if let Some(start_at) = schedule.start_at.filter(|value| !value.trim().is_empty()) {
         map.insert(
@@ -1395,6 +1435,7 @@ fn set_node_schedule(
             serde_json::Value::String(end_at.trim().to_string()),
         );
     }
+    let mut has_time = false;
     if let Some(time_of_day) = schedule
         .time_of_day
         .filter(|value| !value.trim().is_empty())
@@ -1410,12 +1451,37 @@ fn set_node_schedule(
             "time_of_day".into(),
             serde_json::Value::String(time_of_day),
         );
+        has_time = true;
     }
-    if let Some(interval) = schedule
-        .interval_minutes
-        .filter(|value| (1..=10_080).contains(value))
-    {
-        map.insert("interval_minutes".into(), serde_json::Value::from(interval));
+    if needs_time && !has_time {
+        return Err(ApiError(
+            "schedule time_of_day is required for once, daily, weekly, and custom_days".into(),
+            StatusCode::BAD_REQUEST,
+        ));
+    }
+    if needs_days && days_empty {
+        return Err(ApiError(
+            "schedule days_of_week is required for weekly and custom_days".into(),
+            StatusCode::BAD_REQUEST,
+        ));
+    }
+    match schedule.interval_minutes {
+        Some(interval) if (1..=10_080).contains(&interval) => {
+            map.insert("interval_minutes".into(), serde_json::Value::from(interval));
+        }
+        Some(_) => {
+            return Err(ApiError(
+                "schedule interval_minutes must be between 1 and 10080".into(),
+                StatusCode::BAD_REQUEST,
+            ))
+        }
+        None if needs_interval => {
+            return Err(ApiError(
+                "schedule interval_minutes is required for interval mode".into(),
+                StatusCode::BAD_REQUEST,
+            ))
+        }
+        None => {}
     }
     if !days.is_empty() {
         map.insert("days_of_week".into(), serde_json::Value::Array(days));
@@ -2537,30 +2603,146 @@ async fn get_dream_proposals(State(ws): State<SharedWorkspace>) -> impl IntoResp
     let resp: Vec<ProposalResponse> = proposals
         .into_iter()
         .map(|p| {
-            let kind = match &p.kind {
-                crate::dream::ProposalKind::SuggestEdge { .. } => "SuggestEdge",
-                crate::dream::ProposalKind::ReviveGhost { .. } => "ReviveGhost",
-                crate::dream::ProposalKind::MergeNodes { .. } => "MergeNodes",
-                crate::dream::ProposalKind::EntropyAlert { .. } => "EntropyAlert",
+            let (kind, from, to, node_id, a, b, similarity, entropy) = match &p.kind {
+                crate::dream::ProposalKind::SuggestEdge {
+                    from,
+                    to,
+                    similarity,
+                } => (
+                    "SuggestEdge",
+                    Some(from.to_string()),
+                    Some(to.to_string()),
+                    None,
+                    None,
+                    None,
+                    Some(*similarity),
+                    None,
+                ),
+                crate::dream::ProposalKind::ReviveGhost { node_id } => (
+                    "ReviveGhost",
+                    None,
+                    None,
+                    Some(node_id.to_string()),
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+                crate::dream::ProposalKind::MergeNodes { a, b, similarity } => (
+                    "MergeNodes",
+                    None,
+                    None,
+                    None,
+                    Some(a.to_string()),
+                    Some(b.to_string()),
+                    Some(*similarity),
+                    None,
+                ),
+                crate::dream::ProposalKind::EntropyAlert { node_id, entropy } => (
+                    "EntropyAlert",
+                    None,
+                    None,
+                    Some(node_id.to_string()),
+                    None,
+                    None,
+                    None,
+                    Some(*entropy),
+                ),
             };
             ProposalResponse {
                 id: p.id.to_string(),
                 kind: kind.into(),
                 confidence: p.confidence,
                 description: p.description,
+                rationale: p.rationale,
+                action_label: p.action_label,
+                risk: p.risk.label().into(),
+                from,
+                to,
+                node_id,
+                a,
+                b,
+                similarity,
+                entropy,
             }
         })
         .collect();
     Json(resp)
 }
 
-async fn post_synthesize(
-    State(ws): State<SharedWorkspace>,
-    Json(req): Json<SynthesizeRequest>,
-) -> impl IntoResponse {
-    let ws = ws.read().await;
-    let text = SynthesisEngine::new().synthesize_topic(&ws, &req.query);
-    Json(serde_json::json!({ "query": req.query, "synthesis": text }))
+async fn post_dream_apply(
+    State(app): State<AppState>,
+    Json(req): Json<DreamActionRequest>,
+) -> ApiResult<impl IntoResponse> {
+    let parse = |value: Option<String>, label: &str| -> ApiResult<Uuid> {
+        let value = value.ok_or_else(|| {
+            ApiError(format!("{label} is required"), StatusCode::BAD_REQUEST)
+        })?;
+        Uuid::parse_str(&value)
+            .map_err(|_| ApiError(format!("invalid {label} UUID"), StatusCode::BAD_REQUEST))
+    };
+
+    let (action, message, snapshot) = {
+        let mut ws = app.workspace.write().await;
+        match req.kind.as_str() {
+            "SuggestEdge" => {
+                let from = parse(req.from, "from")?;
+                let to = parse(req.to, "to")?;
+                let weight = req.similarity.unwrap_or(0.75).clamp(0.1, 1.0);
+                match ws.connect_nodes(from, to, crate::domain::EdgeType::Connection, weight) {
+                    Ok(()) => {}
+                    Err(crate::error::GraphError::DuplicateEdge { .. }) => {}
+                    Err(err) => return Err(err.into()),
+                }
+                ("connect".to_string(), "Link created.".to_string(), ws.snapshot())
+            }
+            "ReviveGhost" => {
+                let node_id = parse(req.node_id, "node_id")?;
+                let engine = crate::entropy::EntropyEngine::new();
+                ws.reverse_entropy(&engine, node_id);
+                ws.revive_node(node_id)?;
+                ("revive".to_string(), "Node revived.".to_string(), ws.snapshot())
+            }
+            "EntropyAlert" => {
+                let node_id = parse(req.node_id, "node_id")?;
+                let engine = crate::entropy::EntropyEngine::new();
+                ws.reverse_entropy(&engine, node_id);
+                ws.revive_node(node_id)?;
+                (
+                    "stabilize".to_string(),
+                    "Entropy stabilized.".to_string(),
+                    ws.snapshot(),
+                )
+            }
+            "MergeNodes" => {
+                let a = parse(req.a, "a")?;
+                let b = parse(req.b, "b")?;
+                let weight = req.similarity.unwrap_or(0.9).clamp(0.5, 1.0);
+                match ws.connect_nodes(a, b, crate::domain::EdgeType::Resonance, weight) {
+                    Ok(()) => {}
+                    Err(crate::error::GraphError::DuplicateEdge { .. }) => {}
+                    Err(err) => return Err(err.into()),
+                }
+                (
+                    "link_for_review".to_string(),
+                    "Resonance link created for manual merge review.".to_string(),
+                    ws.snapshot(),
+                )
+            }
+            _ => {
+                return Err(ApiError(
+                    "unknown dream action kind".into(),
+                    StatusCode::BAD_REQUEST,
+                ))
+            }
+        }
+    };
+    save_current_snapshot(&app, snapshot, "dream action").await?;
+    Ok(Json(DreamActionResponse {
+        applied: true,
+        action,
+        message,
+    }))
 }
 
 async fn get_knowledge_gaps(
@@ -3011,6 +3193,9 @@ async fn get_weather(State(ws): State<SharedWorkspace>) -> impl IntoResponse {
     let ws = ws.read().await;
     let mut weather = WeatherSystem::new();
     ws.derive_weather(&mut weather);
+    let nodes: Vec<&crate::domain::NodeData> = ws.graph.nodes().collect();
+    let events = ws.focus.trail_between(Utc::now() - chrono::Duration::hours(24), Utc::now());
+    let metrics = weather.metrics(&nodes, &events, Utc::now());
     let (state, intensity, r, g, b, desc) = match &weather.current {
         crate::systems::WeatherState::Energetic {
             pulse_rate,
@@ -3065,6 +3250,13 @@ async fn get_weather(State(ws): State<SharedWorkspace>) -> impl IntoResponse {
         color_g: g,
         color_b: b,
         description: desc.into(),
+        avg_entropy: metrics.avg_entropy,
+        ghost_ratio: metrics.ghost_ratio,
+        recent_focus_hours: metrics.recent_focus_hours,
+        weighted_focus_hours: metrics.weighted_focus_hours,
+        trail_density: metrics.trail_density,
+        exploration: metrics.exploration,
+        deep_ratio: metrics.deep_ratio,
     })
 }
 
@@ -4294,18 +4486,26 @@ async fn post_calendar_event(
 ) -> ApiResult<impl IntoResponse> {
     use crate::calendar::{CalendarEvent, EventCategory};
     use chrono::DateTime;
+    let title = validated_text(req.title, "title", 1_000)?;
     let start = DateTime::parse_from_rfc3339(&req.start_at)
         .map(|t| t.with_timezone(&chrono::Utc))
         .map_err(|_| ApiError("invalid start_at date".into(), StatusCode::BAD_REQUEST))?;
     let end = req
         .end_at
         .as_deref()
-        .and_then(|s| {
+        .map(|s| {
             DateTime::parse_from_rfc3339(s)
-                .ok()
                 .map(|t| t.with_timezone(&chrono::Utc))
+                .map_err(|_| ApiError("invalid end_at date".into(), StatusCode::BAD_REQUEST))
         })
+        .transpose()?
         .unwrap_or_else(|| start + chrono::Duration::hours(1));
+    if end <= start {
+        return Err(ApiError(
+            "end_at must be after start_at".into(),
+            StatusCode::BAD_REQUEST,
+        ));
+    }
     let category = match req.category.as_deref().unwrap_or("meeting") {
         "deadline" => EventCategory::Deadline,
         "task" => EventCategory::Task,
@@ -4315,14 +4515,26 @@ async fn post_calendar_event(
         "milestone" => EventCategory::Milestone,
         _ => EventCategory::Meeting,
     };
-    let mut event = CalendarEvent::new(req.title, category, start, end);
+    let linked_node_id = req
+        .linked_node_id
+        .as_deref()
+        .map(|id| {
+            Uuid::parse_str(id)
+                .map_err(|_| ApiError("invalid linked_node_id".into(), StatusCode::BAD_REQUEST))
+        })
+        .transpose()?;
+    if let Some(linked_node_id) = linked_node_id {
+        let ws = app.workspace.read().await;
+        if ws.graph.get_node(linked_node_id).is_none() {
+            return Err(ApiError("linked node not found".into(), StatusCode::NOT_FOUND));
+        }
+    }
+    let mut event = CalendarEvent::new(title, category, start, end);
     if let Some(desc) = req.description {
         event.description = desc;
     }
-    if let Some(id_str) = req.linked_node_id {
-        if let Ok(nid) = Uuid::parse_str(&id_str) {
-            event.linked_nodes.push(nid);
-        }
+    if let Some(nid) = linked_node_id {
+        event.linked_nodes.push(nid);
     }
     let id = event.id.to_string();
     let snapshot = {
@@ -4342,6 +4554,9 @@ async fn delete_calendar_event(
         .map_err(|_| ApiError("invalid UUID".into(), StatusCode::BAD_REQUEST))?;
     let snapshot = {
         let mut ws = app.workspace.write().await;
+        if ws.calendar.get_event(ev_id).is_none() {
+            return Err(ApiError("calendar event not found".into(), StatusCode::NOT_FOUND));
+        }
         ws.calendar.remove_event(ev_id);
         ws.snapshot()
     };
@@ -4430,10 +4645,7 @@ async fn post_task(
     use crate::domain::{EdgeType, NodeData};
     use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
 
-    let title = req.title.trim();
-    if title.is_empty() {
-        return Err(ApiError("title required".into(), StatusCode::BAD_REQUEST));
-    }
+    let title = validated_text(req.title, "title", 1_000)?;
     let date = req
         .date
         .as_deref()
@@ -4455,11 +4667,12 @@ async fn post_task(
     let due_at = req
         .due_at
         .as_deref()
-        .and_then(|raw| {
+        .map(|raw| {
             DateTime::parse_from_rfc3339(raw)
-                .ok()
                 .map(|dt| dt.with_timezone(&Utc))
+                .map_err(|_| ApiError("due_at must be RFC3339".into(), StatusCode::BAD_REQUEST))
         })
+        .transpose()?
         .unwrap_or_else(|| {
             let time = NaiveTime::from_hms_opt(12, 0, 0).unwrap();
             DateTime::<Utc>::from_naive_utc_and_offset(date.and_time(time), Utc)
@@ -4468,7 +4681,7 @@ async fn post_task(
 
     let snapshot = {
         let mut ws = app.workspace.write().await;
-        let mut node = NodeData::new(NodeType::Process, title.to_string());
+        let mut node = NodeData::new(NodeType::Process, title.clone());
         node.gravity = 1.8;
         node.entropy = 0.03;
         node.aura_color = "#2dd4bf".into();
@@ -4492,7 +4705,7 @@ async fn post_task(
         ]);
         let task_id = ws.graph.add_node(node)?;
 
-        let mut event = CalendarEvent::new(title.to_string(), EventCategory::Task, due_at, end_at);
+        let mut event = CalendarEvent::new(title, EventCategory::Task, due_at, end_at);
         event.description = req.notes.unwrap_or_default();
         event.linked_nodes.push(task_id);
         event.anticipation_days = 1;
@@ -5375,6 +5588,7 @@ pub fn build_router(app: AppState) -> Router {
         .route("/analytics/bridges", get(get_analytics_bridges))
         // dream + synthesis
         .route("/dream/proposals", get(get_dream_proposals))
+        .route("/dream/apply", post(post_dream_apply))
         .route("/synthesize", post(post_synthesize_v2))
         .route("/synthesis/gaps", get(get_knowledge_gaps))
         .route("/synthesis/chain", post(post_thought_chain))

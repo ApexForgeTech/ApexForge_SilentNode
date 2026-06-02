@@ -3,6 +3,17 @@ use chrono::{DateTime, Duration, Utc};
 use std::collections::HashSet;
 use uuid::Uuid;
 
+#[derive(Debug, Clone, Copy)]
+pub struct WeatherMetrics {
+    pub avg_entropy: f32,
+    pub ghost_ratio: f32,
+    pub recent_focus_hours: f32,
+    pub weighted_focus_hours: f32,
+    pub trail_density: f32,
+    pub exploration: f32,
+    pub deep_ratio: f32,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum WeatherState {
     /// High creation rate + exploration: new connections forming rapidly.
@@ -135,6 +146,15 @@ impl WeatherSystem {
         }
     }
 
+    pub fn metrics(
+        &self,
+        nodes: &[&NodeData],
+        focus_events: &[FocusEvent],
+        now: DateTime<Utc>,
+    ) -> WeatherMetrics {
+        compute_metrics(nodes, focus_events, now)
+    }
+
     /// Advance blend animation (call each frame with delta_time in seconds).
     pub fn tick(&mut self, dt: f32) {
         if self.transition_progress < 1.0 {
@@ -199,23 +219,12 @@ fn compute_weather(
         };
     }
 
-    let total = nodes.len() as f32;
-    let avg_entropy: f32 = nodes.iter().map(|n| n.entropy).sum::<f32>() / total;
-    let ghost_ratio: f32 = nodes.iter().filter(|n| n.is_ghost).count() as f32 / total;
-
-    let recent: Vec<&FocusEvent> = focus_events
-        .iter()
-        .filter(|e| e.timestamp > now - Duration::hours(24))
-        .collect();
-
-    let trail_density = (recent.len() as f32 / 20.0).clamp(0.0, 1.0);
-    let unique: HashSet<Uuid> = recent.iter().map(|e| e.node_id).collect();
-    let exploration = (unique.len() as f32 / total).clamp(0.0, 1.0);
-    let deep_ratio = recent
-        .iter()
-        .filter(|e| e.depth == FocusDepth::DeepWork)
-        .count() as f32
-        / recent.len().max(1) as f32;
+    let metrics = compute_metrics(nodes, focus_events, now);
+    let avg_entropy = metrics.avg_entropy;
+    let ghost_ratio = metrics.ghost_ratio;
+    let trail_density = metrics.trail_density;
+    let exploration = metrics.exploration;
+    let deep_ratio = metrics.deep_ratio;
 
     if avg_entropy > 0.6 && ghost_ratio > 0.25 {
         return WeatherState::Fading {
@@ -223,27 +232,90 @@ fn compute_weather(
             decay_speed: ghost_ratio,
         };
     }
-    if trail_density > 0.65 && exploration > 0.45 {
-        return WeatherState::Energetic {
-            pulse_rate: trail_density,
-            expansion: exploration,
-        };
-    }
-    if trail_density > 0.4 && deep_ratio > 0.45 {
+    if (metrics.weighted_focus_hours > 0.35 && deep_ratio > 0.55)
+        || (trail_density > 0.28 && deep_ratio > 0.45)
+    {
         return WeatherState::Calm {
             clarity: deep_ratio,
             stillness: 1.0 - exploration,
         };
     }
-    if trail_density < 0.2 && avg_entropy > 0.28 {
+    if trail_density > 0.55 && exploration > 0.35 && deep_ratio < 0.65 {
+        return WeatherState::Energetic {
+            pulse_rate: trail_density,
+            expansion: exploration,
+        };
+    }
+    if trail_density < 0.16 && avg_entropy > 0.28 {
         return WeatherState::Reflective {
             ghost_visibility: ghost_ratio,
             warmth: 0.5,
         };
     }
+    if avg_entropy < 0.20 && ghost_ratio < 0.10 && exploration < 0.30 {
+        return WeatherState::Calm {
+            clarity: (0.55 + deep_ratio * 0.35).clamp(0.55, 0.95),
+            stillness: 1.0 - exploration,
+        };
+    }
     WeatherState::Turbulent {
         intensity: (avg_entropy + trail_density) * 0.5,
         chaos_frequency: exploration * 2.0,
+    }
+}
+
+fn compute_metrics(
+    nodes: &[&NodeData],
+    focus_events: &[FocusEvent],
+    now: DateTime<Utc>,
+) -> WeatherMetrics {
+    if nodes.is_empty() {
+        return WeatherMetrics {
+            avg_entropy: 0.0,
+            ghost_ratio: 0.0,
+            recent_focus_hours: 0.0,
+            weighted_focus_hours: 0.0,
+            trail_density: 0.0,
+            exploration: 0.0,
+            deep_ratio: 0.0,
+        };
+    }
+
+    let total = nodes.len() as f32;
+    let avg_entropy = (nodes.iter().map(|n| n.entropy).sum::<f32>() / total).clamp(0.0, 1.0);
+    let ghost_ratio = (nodes.iter().filter(|n| n.is_ghost).count() as f32 / total).clamp(0.0, 1.0);
+
+    let recent: Vec<&FocusEvent> = focus_events
+        .iter()
+        .filter(|e| e.timestamp > now - Duration::hours(24))
+        .collect();
+    let raw_seconds: f32 = recent
+        .iter()
+        .map(|e| e.duration_seconds.max(0.0).min(8.0 * 3600.0))
+        .sum();
+    let weighted_seconds: f32 = recent
+        .iter()
+        .map(|e| e.duration_seconds.max(0.0).min(8.0 * 3600.0) * e.depth.weight())
+        .sum();
+    let unique: HashSet<Uuid> = recent.iter().map(|e| e.node_id).collect();
+    let deep_seconds: f32 = recent
+        .iter()
+        .filter(|e| e.depth == FocusDepth::DeepWork)
+        .map(|e| e.duration_seconds.max(0.0).min(8.0 * 3600.0))
+        .sum();
+
+    WeatherMetrics {
+        avg_entropy,
+        ghost_ratio,
+        recent_focus_hours: raw_seconds / 3600.0,
+        weighted_focus_hours: weighted_seconds / 3600.0,
+        trail_density: (weighted_seconds / (3.0 * 3600.0)).clamp(0.0, 1.0),
+        exploration: (unique.len() as f32 / total.min(12.0)).clamp(0.0, 1.0),
+        deep_ratio: if raw_seconds > 0.0 {
+            (deep_seconds / raw_seconds).clamp(0.0, 1.0)
+        } else {
+            0.0
+        },
     }
 }
 

@@ -1,6 +1,5 @@
 import { useState, useEffect } from 'react'
 import type { DreamProposal, SNode } from '../types'
-import { NODE_COLORS } from '../types'
 import { api } from '../api'
 import { toast } from './Toast'
 
@@ -25,6 +24,7 @@ export default function DreamView({ nodes }: Props) {
   const [synthesis, setSynthesis]  = useState('')
   const [synResult, setSynResult]  = useState<{ narrative: string; related_nodes: string[] } | null>(null)
   const [synLoading, setSynLoading] = useState(false)
+  const [actionLoading, setActionLoading] = useState(false)
   const [loading, setLoading] = useState(true)
 
   const nodeMap = new Map(nodes.map(n => [n.id, n]))
@@ -34,11 +34,19 @@ export default function DreamView({ nodes }: Props) {
     : 0
 
   useEffect(() => {
+    loadProposals()
+  }, [])
+
+  async function loadProposals(selectFirst = true) {
+    setLoading(true)
     api.dreamProposals()
-      .then(p => { setProposals(p); if (p.length) setSelected(p[0]) })
+      .then(p => {
+        setProposals(p)
+        if (selectFirst) setSelected(p[0] ?? null)
+      })
       .catch(() => {})
       .finally(() => setLoading(false))
-  }, [])
+  }
 
   async function runSynthesis() {
     if (!synthesis.trim()) return
@@ -48,6 +56,26 @@ export default function DreamView({ nodes }: Props) {
       setSynResult(r)
     } catch (e) { toast(String(e), 'error') }
     setSynLoading(false)
+  }
+
+  async function applyProposal(proposal: DreamProposal) {
+    setActionLoading(true)
+    try {
+      const result = await api.applyDreamProposal(proposal)
+      toast(result.message || 'Dream action applied')
+      await loadProposals()
+    } catch (e) {
+      toast(String(e), 'error')
+    } finally {
+      setActionLoading(false)
+    }
+  }
+
+  function ignoreProposal(proposal: DreamProposal) {
+    const next = proposals.filter(p => p.id !== proposal.id)
+    setProposals(next)
+    setSelected(next[0] ?? null)
+    toast('Proposal ignored')
   }
 
   return (
@@ -99,6 +127,7 @@ export default function DreamView({ nodes }: Props) {
                     </div>
                     <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 2, flexShrink: 0 }}>
                       <span style={{ color: col, fontSize: 11, fontWeight: 700 }}>{(p.confidence * 100).toFixed(0)}%</span>
+                      <span style={{ color: 'var(--text-muted)', fontSize: 9 }}>{p.risk}</span>
                       <div className="prog-track" style={{ width: 36 }}>
                         <div className="prog-fill" style={{ width: `${(p.confidence*100).toFixed(0)}%`, background: col }} />
                       </div>
@@ -124,6 +153,9 @@ export default function DreamView({ nodes }: Props) {
                     <div style={{ color: 'var(--text-primary)', fontSize: 13, lineHeight: 1.7, marginBottom: 16 }}>
                       {selected.description}
                     </div>
+                    <div style={{ color: 'var(--text-secondary)', fontSize: 12, lineHeight: 1.6, marginBottom: 16 }}>
+                      {selected.rationale}
+                    </div>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 16 }}>
                       <span style={{ color: 'var(--text-muted)', fontSize: 11 }}>Confidence</span>
                       <div className="prog-track" style={{ flex: 1 }}>
@@ -131,11 +163,23 @@ export default function DreamView({ nodes }: Props) {
                       </div>
                       <span style={{ color: col, fontWeight: 700, fontSize: 13 }}>{(selected.confidence*100).toFixed(0)}%</span>
                     </div>
-                    {selected.kind === 'ReviveGhost' && (
-                      <button className="btn-amber btn-sm" onClick={() => toast('Open the Ghost or Nodes view to revive this node', 'info')}>
-                        Mark for revival
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginBottom: 12 }}>
+                      <button
+                        className="btn-primary btn-sm"
+                        disabled={actionLoading || !selected.action_label}
+                        onClick={() => applyProposal(selected)}
+                      >
+                        {actionLoading ? 'Applying…' : selected.action_label || 'No action'}
                       </button>
-                    )}
+                      <button className="btn-ghost btn-sm" disabled={actionLoading} onClick={() => ignoreProposal(selected)}>
+                        Ignore
+                      </button>
+                    </div>
+                    <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                      <span className="badge" style={{ fontSize: 9 }}>Risk: {selected.risk}</span>
+                      {selected.similarity !== undefined && <span className="badge badge-cyan" style={{ fontSize: 9 }}>Similarity {(selected.similarity * 100).toFixed(0)}%</span>}
+                      {selected.entropy !== undefined && <span className="badge badge-amber" style={{ fontSize: 9 }}>Entropy {(selected.entropy * 100).toFixed(0)}%</span>}
+                    </div>
                   </div>
                 )
               })()}
