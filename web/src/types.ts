@@ -113,6 +113,7 @@ export interface JournalEntry {
   timestamp: string
   season: string | null
   linked_nodes: string[]
+  linked_node_previews?: string[]
 }
 
 // ── Season ───────────────────────────────────────────────────────────────────
@@ -435,6 +436,8 @@ export interface ForgeArtifactData {
   artifact_type: string
   parent_ids: string[]
   child_ids: string[]
+  parent_previews?: string[]
+  child_previews?: string[]
   generation: number
   heat: number
 }

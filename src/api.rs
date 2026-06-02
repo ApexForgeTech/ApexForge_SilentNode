@@ -220,6 +220,12 @@ pub struct JournalEntryResponse {
     pub timestamp: String,
     pub season: Option<String>,
     pub linked_nodes: Vec<String>,
+    pub linked_node_previews: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct JournalRepairResponse {
+    pub repaired_entries: usize,
 }
 
 // ── Request shapes ─────────────────────────────────────────────────────────────
@@ -688,6 +694,8 @@ pub struct ForgeArtifactResponse {
     pub artifact_type: String,
     pub parent_ids: Vec<String>,
     pub child_ids: Vec<String>,
+    pub parent_previews: Vec<String>,
+    pub child_previews: Vec<String>,
     pub generation: usize,
     pub heat: f32,
 }
@@ -2421,10 +2429,16 @@ async fn post_journal(
     Json(req): Json<JournalRequest>,
 ) -> ApiResult<impl IntoResponse> {
     let text = validated_text(req.text, "text", 20_000)?;
-    let (entry, snapshot) = {
+    let (entry, linked_node_previews, snapshot) = {
         let mut ws = app.workspace.write().await;
         let entry = ws.add_journal_entry(text, req.season);
-        (entry.clone(), ws.snapshot())
+        let linked_node_previews = entry
+            .linked_nodes
+            .iter()
+            .filter_map(|id| ws.graph.get_node(*id))
+            .map(|node| preview_text(&node.content, 48))
+            .collect();
+        (entry.clone(), linked_node_previews, ws.snapshot())
     };
     save_current_snapshot(&app, snapshot, "journal").await?;
     Ok(Json(JournalEntryResponse {
@@ -2433,6 +2447,7 @@ async fn post_journal(
         timestamp: entry.timestamp.to_rfc3339(),
         season: entry.season.clone(),
         linked_nodes: entry.linked_nodes.iter().map(|id| id.to_string()).collect(),
+        linked_node_previews,
     }))
 }
 
@@ -2448,9 +2463,25 @@ async fn get_journal(State(ws): State<SharedWorkspace>) -> impl IntoResponse {
             timestamp: e.timestamp.to_rfc3339(),
             season: e.season.clone(),
             linked_nodes: e.linked_nodes.iter().map(|id| id.to_string()).collect(),
+            linked_node_previews: e
+                .linked_nodes
+                .iter()
+                .filter_map(|id| ws.graph.get_node(*id))
+                .map(|node| preview_text(&node.content, 48))
+                .collect(),
         })
         .collect();
     Json(entries)
+}
+
+async fn post_journal_repair_links(State(app): State<AppState>) -> ApiResult<impl IntoResponse> {
+    let (repaired_entries, snapshot) = {
+        let mut ws = app.workspace.write().await;
+        let repaired_entries = ws.repair_journal_links();
+        (repaired_entries, ws.snapshot())
+    };
+    save_current_snapshot(&app, snapshot, "journal repair").await?;
+    Ok(Json(JournalRepairResponse { repaired_entries }))
 }
 
 async fn get_season(State(ws): State<SharedWorkspace>) -> impl IntoResponse {
@@ -3889,27 +3920,41 @@ async fn get_forge_genealogy(State(ws): State<SharedWorkspace>) -> impl IntoResp
             )
         })
         .map(|n| {
-            let parents: Vec<String> = ws
+            let parent_ids_raw: Vec<_> = ws
                 .graph
                 .incoming_edges(n.id)
                 .unwrap_or_default()
                 .into_iter()
-                .map(|e| e.source_id.to_string())
+                .map(|e| e.source_id)
                 .collect();
-            let children: Vec<String> = ws
+            let child_ids_raw: Vec<_> = ws
                 .graph
                 .outgoing_edges(n.id)
                 .unwrap_or_default()
                 .into_iter()
-                .map(|e| e.target_id.to_string())
+                .map(|e| e.target_id)
+                .collect();
+            let parents: Vec<String> = parent_ids_raw.iter().map(|id| id.to_string()).collect();
+            let children: Vec<String> = child_ids_raw.iter().map(|id| id.to_string()).collect();
+            let parent_previews = parent_ids_raw
+                .iter()
+                .filter_map(|id| ws.graph.get_node(*id))
+                .map(|node| preview_text(&node.content, 36))
+                .collect();
+            let child_previews = child_ids_raw
+                .iter()
+                .filter_map(|id| ws.graph.get_node(*id))
+                .map(|node| preview_text(&node.content, 36))
                 .collect();
             ForgeArtifactResponse {
                 node_id: n.id.to_string(),
-                label: n.content.chars().take(56).collect(),
+                label: preview_text(&n.content, 56),
                 artifact_type: format!("{:?}", n.node_type),
                 generation: parents.len().min(9),
                 parent_ids: parents,
                 child_ids: children,
+                parent_previews,
+                child_previews,
                 heat: ((n.gravity / 10.0) + (n.velocity / 10.0)).clamp(0.0, 1.0),
             }
         })
@@ -4012,12 +4057,12 @@ async fn get_constellations(State(ws): State<SharedWorkspace>) -> impl IntoRespo
                 .clamp(0.0, 1.0);
             ConstellationResponse {
                 id: anchor.id.to_string(),
-                label: anchor.content.chars().take(48).collect(),
+                label: preview_text(&anchor.content, 48),
                 kind: kind.into(),
                 member_ids: members.iter().map(|n| n.id.to_string()).collect(),
                 member_previews: members
                     .iter()
-                    .map(|n| n.content.chars().take(28).collect())
+                    .map(|n| preview_text(&n.content, 28))
                     .collect(),
                 gravity: anchor.gravity,
                 emotional_weight,
@@ -4481,7 +4526,8 @@ async fn get_void_zones(State(ws): State<SharedWorkspace>) -> impl IntoResponse 
             node_id: n.id.to_string(),
             content_preview: n.content.chars().take(50).collect(),
             incubation_days: incubation,
-            is_mature: check.as_ref().map(|c| c.emergence_likely).unwrap_or(false),
+            is_mature: incubation >= 7.0
+                || check.as_ref().map(|c| c.emergence_likely).unwrap_or(false),
             resonance_readiness: check.as_ref().map(|c| c.resonance_score).unwrap_or(0.0),
             entropy: n.entropy,
         });
@@ -5762,6 +5808,7 @@ pub fn build_router(app: AppState) -> Router {
             axum::routing::delete(delete_focus_session),
         )
         .route("/journal", get(get_journal).post(post_journal))
+        .route("/journal/repair-links", post(post_journal_repair_links))
         .route("/tasks", get(get_tasks).post(post_task))
         .route(
             "/tasks/:id/complete",

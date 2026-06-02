@@ -37,6 +37,7 @@ use crate::audio::{atmosphere_from_entropy, atmosphere_from_season, AtmosphereKi
 // Phase 10
 use crate::identity::{IdentityEngine, LivingSignature, ShadowProject, ShadowProjectDetector};
 use chrono::{Duration, NaiveDate, Utc};
+use std::collections::HashSet;
 use std::path::Path;
 use uuid::Uuid;
 
@@ -157,10 +158,117 @@ impl SilentNodeWorkspace {
         content: impl Into<String>,
         season: Option<String>,
     ) -> JournalEntry {
-        let linked_nodes = self
-            .focus
-            .active_nodes_since(Utc::now() - Duration::hours(1));
+        let content = content.into();
+        let linked_nodes = self.journal_link_candidates(&content);
         self.journal.add_entry(content, linked_nodes, season)
+    }
+
+    pub fn repair_journal_links(&mut self) -> usize {
+        let repairs = self
+            .journal
+            .entries()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                if entry.linked_nodes.is_empty() {
+                    let links = self.journal_link_candidates(&entry.content);
+                    if links.is_empty() {
+                        None
+                    } else {
+                        Some((index, links))
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let repaired = repairs.len();
+        for (index, links) in repairs {
+            if let Some(entry) = self.journal.entries_mut().get_mut(index) {
+                entry.linked_nodes = links;
+            }
+        }
+        repaired
+    }
+
+    fn journal_link_candidates(&self, content: &str) -> Vec<Uuid> {
+        let mut seen = HashSet::new();
+        let mut linked_nodes = self
+            .focus
+            .active_nodes_since(Utc::now() - Duration::hours(1))
+            .into_iter()
+            .filter(|id| seen.insert(*id))
+            .collect::<Vec<_>>();
+
+        for node_id in self.semantic_journal_matches(content, 4) {
+            if seen.insert(node_id) {
+                linked_nodes.push(node_id);
+            }
+        }
+
+        linked_nodes
+    }
+
+    fn semantic_journal_matches(&self, content: &str, limit: usize) -> Vec<Uuid> {
+        let journal_tokens = meaningful_tokens(content);
+        if journal_tokens.is_empty() {
+            return Vec::new();
+        }
+
+        let mut scored = self
+            .graph
+            .nodes()
+            .filter(|node| !node.is_ghost && !node.is_fossil)
+            .filter_map(|node| {
+                let node_text = node_search_text(node);
+                let node_tokens = meaningful_tokens(&node_text);
+                if node_tokens.is_empty() {
+                    return None;
+                }
+
+                let overlap = journal_tokens.intersection(&node_tokens).count();
+                let exact_title_bonus = node
+                    .content
+                    .lines()
+                    .next()
+                    .map(|title| {
+                        let title = title.trim().to_lowercase();
+                        title.chars().count() >= 5 && content.to_lowercase().contains(&title)
+                    })
+                    .unwrap_or(false);
+
+                let score = if exact_title_bonus {
+                    1.0
+                } else {
+                    overlap as f32
+                        / ((journal_tokens.len() as f32).sqrt() * (node_tokens.len() as f32).sqrt())
+                };
+
+                let strong_overlap = overlap >= 2 && score >= 0.16;
+                if exact_title_bonus || strong_overlap || score >= 0.28 {
+                    Some((node.id, score, node.gravity, node.access_count))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        scored.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    b.2.partial_cmp(&a.2)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| b.3.cmp(&a.3))
+        });
+
+        scored
+            .into_iter()
+            .take(limit)
+            .map(|(node_id, _, _, _)| node_id)
+            .collect()
     }
 
     pub fn tick_entropy(&mut self, entropy_engine: &EntropyEngine) {
@@ -591,6 +699,7 @@ impl SilentNodeWorkspace {
         node.is_void = true;
         node.entropy = 0.0; // void nodes don't decay
         node.velocity = 0.0; // void nodes don't move
+        node.accessed_at = Utc::now(); // used as persisted void-entry time if runtime zones reset
                              // Create or update a VoidZone tracking this node
         let already_tracked = self
             .void_zones
@@ -610,6 +719,7 @@ impl SilentNodeWorkspace {
             .get_node_mut(node_id)
             .ok_or(GraphError::NodeNotFound(node_id))?;
         node.is_void = false;
+        node.accessed_at = Utc::now();
         // Remove from void zone tracking
         self.void_zones.retain(|z| !z.entities.contains(&node_id));
         Ok(())
@@ -919,4 +1029,73 @@ impl SilentNodeWorkspace {
         }
         adj
     }
+}
+
+fn node_search_text(node: &NodeData) -> String {
+    let mut parts = vec![node.content.clone(), format!("{:?}", node.node_type)];
+    for key in ["nickname", "custom_type", "source", "tags"] {
+        if let Some(value) = node.metadata.get(key) {
+            if let Some(text) = value.as_str() {
+                parts.push(text.to_string());
+            } else if value.is_array() {
+                parts.push(value.to_string());
+            }
+        }
+    }
+    parts.join(" ")
+}
+
+fn meaningful_tokens(input: &str) -> HashSet<String> {
+    input
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter_map(|raw| {
+            let token = raw.trim().to_lowercase();
+            if token.chars().count() < 3 || is_journal_stopword(&token) {
+                None
+            } else {
+                Some(token)
+            }
+        })
+        .collect()
+}
+
+fn is_journal_stopword(token: &str) -> bool {
+    matches!(
+        token,
+        "and"
+            | "the"
+            | "for"
+            | "with"
+            | "this"
+            | "that"
+            | "from"
+            | "not"
+            | "but"
+            | "are"
+            | "was"
+            | "were"
+            | "bir"
+            | "iki"
+            | "uc"
+            | "üç"
+            | "ve"
+            | "və"
+            | "ile"
+            | "ilə"
+            | "ki"
+            | "bu"
+            | "da"
+            | "de"
+            | "dedi"
+            | "note"
+            | "amma"
+            | "lazim"
+            | "lazımdır"
+            | "gerek"
+            | "gərək"
+            | "qaldi"
+            | "qaldı"
+            | "etdim"
+            | "bugun"
+    )
 }

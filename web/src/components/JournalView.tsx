@@ -1,16 +1,17 @@
 import { useState } from 'react'
-import type { JournalEntry, SeasonReport } from '../types'
+import type { JournalEntry, SeasonReport, SNode } from '../types'
 import { SEASON_COLORS } from '../types'
 import { api } from '../api'
 import { toast } from './Toast'
 
 interface Props {
   entries: JournalEntry[]
+  nodes: SNode[]
   season: SeasonReport | null
   onRefresh: () => void
 }
 
-export default function JournalView({ entries, season, onRefresh }: Props) {
+export default function JournalView({ entries, nodes, season, onRefresh }: Props) {
   const [text,     setText]     = useState('')
   const [saving,   setSaving]   = useState(false)
   const [selected, setSelected] = useState<JournalEntry | null>(null)
@@ -19,6 +20,7 @@ export default function JournalView({ entries, season, onRefresh }: Props) {
   const filtered = [...entries]
     .reverse()
     .filter(e => !search || e.content.toLowerCase().includes(search.toLowerCase()))
+  const nodeMap = new Map(nodes.map(node => [node.id, node]))
 
   async function save() {
     if (!text.trim()) return
@@ -139,11 +141,19 @@ export default function JournalView({ entries, season, onRefresh }: Props) {
                     LINKED NODES
                   </div>
                   <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5 }}>
-                    {selected.linked_nodes.map(id => (
-                      <span key={id} className="badge badge-cyan" style={{ fontSize: 9 }}>
-                        {id.slice(0, 8)}…
-                      </span>
-                    ))}
+                    {selected.linked_nodes.map((id, index) => {
+                      const node = nodeMap.get(id)
+                      const label =
+                        node?.nickname ||
+                        node?.content.split('\n')[0] ||
+                        selected.linked_node_previews?.[index] ||
+                        `${id.slice(0, 8)}…`
+                      return (
+                        <span key={id} className="badge badge-cyan" title={id} style={{ fontSize: 9 }}>
+                          {label.slice(0, 34)}
+                        </span>
+                      )
+                    })}
                   </div>
                 </div>
               )}

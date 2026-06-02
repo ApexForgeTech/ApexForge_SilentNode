@@ -369,7 +369,7 @@ export default function App() {
             <div className="sn-panel-wrap">
               <Suspense fallback={<PanelFallback />}>
                 {currentPanel === 'nodes' && <NodesView nodes={nodes} onRefresh={refresh} onAddThought={() => setAddingNode(true)} />}
-                {currentPanel === 'journal' && <JournalView entries={journal} season={season} onRefresh={refresh} />}
+                {currentPanel === 'journal' && <JournalView entries={journal} nodes={nodes} season={season} onRefresh={refresh} />}
                 {currentPanel === 'forge' && <ForgeView nodes={nodes} onRefresh={refresh} />}
                 {currentPanel === 'genealogy' && <ForgeGenealogyView />}
                 {currentPanel === 'terminal' && <LivingTerminalView />}

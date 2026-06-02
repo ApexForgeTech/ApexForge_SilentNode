@@ -32,6 +32,10 @@ impl JournalEngine {
         &self.entries
     }
 
+    pub fn entries_mut(&mut self) -> &mut [JournalEntry] {
+        &mut self.entries
+    }
+
     pub fn search(&self, query: &str) -> Vec<JournalEntry> {
         let needle = query.to_lowercase();
         self.entries

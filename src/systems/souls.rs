@@ -1,4 +1,5 @@
 use crate::domain::{NodeData, NodeType, TemporalSnapshot};
+use chrono::Utc;
 use uuid::Uuid;
 
 /// Visual style for particles emitted by a Project node.
@@ -54,7 +55,14 @@ impl ProjectSoul {
 
         // Activity: recent snapshot activity
         let recent_changes = snapshots.iter().filter(|s| s.node_id == node.id).count();
-        let activity = (recent_changes as f32 / 20.0).clamp(0.0, 1.0);
+        let snapshot_activity = (recent_changes as f32 / 20.0).clamp(0.0, 1.0);
+        let access_activity = ((node.access_count as f32).ln_1p() / 6.0).clamp(0.0, 1.0);
+        let recency_days =
+            (Utc::now() - node.accessed_at).num_seconds().max(0) as f32 / 86_400.0;
+        let recency_activity = (1.0 / (1.0 + recency_days / 7.0)).clamp(0.0, 1.0);
+        let activity =
+            (snapshot_activity * 0.55 + access_activity * 0.25 + recency_activity * 0.20)
+                .clamp(0.0, 1.0);
 
         // Maturity: normalized entropy inverse (fossil = very mature)
         let maturity = if node.is_fossil {

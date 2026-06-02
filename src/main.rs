@@ -181,6 +181,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 entry.linked_nodes.len()
             );
         }
+        Command::JournalRepairLinks => {
+            let mut workspace = load_workspace(&config)?;
+            let repaired = workspace.repair_journal_links();
+            persist_and_render(&workspace, &config)?;
+            println!("Repaired journal links for {repaired} entrie(s).");
+        }
         Command::JournalSearch { query } => {
             let workspace = load_workspace(&config)?;
             let entries = workspace.search_journal(&query);
@@ -2053,6 +2059,7 @@ enum Command {
     JournalList {
         days: i64,
     },
+    JournalRepairLinks,
     JournalRange {
         from: DateTime<Utc>,
         to: DateTime<Utc>,
@@ -2424,6 +2431,7 @@ impl Command {
                     .transpose()?
                     .unwrap_or(30),
             }),
+            "journal-repair-links" => Ok(Self::JournalRepairLinks),
             "journal-range" => {
                 if args.len() < 3 {
                     return Err("journal-range requires <from-rfc3339> <to-rfc3339>".into());
@@ -3488,6 +3496,7 @@ fn print_help() {
     println!("  cargo run -- journal-season <season> <text>");
     println!("  cargo run -- journal-search <query>");
     println!("  cargo run -- journal-list [days]");
+    println!("  cargo run -- journal-repair-links");
     println!("  cargo run -- journal-range <from-rfc3339> <to-rfc3339>");
     println!("  cargo run -- focus <node-id> <seconds> <glance|read|edit|deep_work>");
     println!("  cargo run -- trail [hours]");

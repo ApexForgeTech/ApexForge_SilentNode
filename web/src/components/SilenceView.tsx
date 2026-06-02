@@ -26,6 +26,7 @@ export default function SilenceView() {
     try {
       await api.connect(nodeA, nodeB)
       toast('Bridge created — nodes connected')
+      api.silence().then(setData).catch(() => {})
     } catch (e) { toast(String(e), 'error') }
   }
 
@@ -33,6 +34,7 @@ export default function SilenceView() {
     try {
       await api.addThought(content)
       toast(`Node materialized: ${content.slice(0, 30)}`)
+      api.silence().then(setData).catch(() => {})
     } catch (e) { toast(String(e), 'error') }
   }
 

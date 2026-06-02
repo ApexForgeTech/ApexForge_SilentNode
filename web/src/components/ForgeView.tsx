@@ -51,7 +51,7 @@ export default function ForgeView({ nodes, onRefresh }: Props) {
     try {
       if (kind === 'thought') {
         if (!text.trim()) { toast('Enter thought content', 'error'); return }
-        const { node_id } = await api.addThought(text.trim())
+        await api.addThought(text.trim())
         toast('Thought materialized into the universe')
         addToHistory('thought', text.trim())
         setText('')
@@ -76,6 +76,7 @@ export default function ForgeView({ nodes, onRefresh }: Props) {
         toast('Chronicle entry recorded')
         addToHistory('journal', text.trim())
         setText('')
+        onRefresh()
       }
 
       if (kind === 'cluster') {
