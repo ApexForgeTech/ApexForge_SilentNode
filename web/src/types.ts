@@ -56,6 +56,19 @@ export interface NotificationSettingsUpdate {
   default_channel?: 'app' | 'telegram' | 'both'
 }
 
+export interface ActiveFocus {
+  active: boolean
+  session_id?: string | null
+  node_id?: string | null
+  node_nickname?: string | null
+  node_preview?: string | null
+  depth?: string | null
+  started_at?: string | null
+  elapsed_seconds: number
+  timeout_seconds?: number | null
+  remaining_seconds?: number | null
+}
+
 // ── Edge ─────────────────────────────────────────────────────────────────────
 export interface SEdge {
   source_id: string

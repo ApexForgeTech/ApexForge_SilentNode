@@ -85,12 +85,12 @@ export default function IntelligenceView({ oracle, civs, nodes, onSelectNode, se
       if (s.status === 'fulfilled') setSuggestions(s.value)
       setLoading(false)
     })
-  }, [])
+  }, [nodes.length])
 
   const focusNode = async (id: string) => {
     try {
-      await api.recordFocus(id, 30, 'Read')
-      toast('Focus recorded')
+      await api.startFocus(id, 'DeepWork')
+      toast('Focus started')
       onSelectNode(id)
     } catch (e) { toast(String(e), 'error') }
   }

@@ -84,7 +84,12 @@ class MarkovSequenceModel:
             }
 
         events_sorted = sorted(events, key=lambda e: e["ts_float"])
+        for ev in events_sorted:
+            nid = ev["node_id"]
+            self.node_access_count[nid] = self.node_access_count.get(nid, 0) + 1
+
         if len(events_sorted) < 2:
+            self.n_unique_nodes = len(self.node_access_count)
             return {
                 "status":   "insufficient_data",
                 "n_events": len(events_sorted),
@@ -97,7 +102,6 @@ class MarkovSequenceModel:
 
         for ev in events_sorted:
             nid = ev["node_id"]
-            self.node_access_count[nid] = self.node_access_count.get(nid, 0) + 1
 
             if prev_event is not None:
                 time_diff = ev["ts_float"] - prev_event["ts_float"]
@@ -215,11 +219,11 @@ class MarkovSequenceModel:
         Applies optional time-of-day weighting.
         """
         if not self.trained:
-            return self._fallback_popular(top_k)
+            return self._fallback_popular(top_k, exclude={current_node_id})
 
         counts = self.transitions.get(current_node_id, {})
         if not counts:
-            return self._fallback_popular(top_k)
+            return self._fallback_popular(top_k, exclude={current_node_id})
 
         # Convert to float scores for optional boosting
         total = sum(counts.values()) or 1
@@ -315,12 +319,16 @@ class MarkovSequenceModel:
             if len(results) >= top_k:
                 break
 
-        return results if results else self._fallback_popular(top_k)
+        return results if results else self._fallback_popular(top_k, exclude=session_set)
 
-    def _fallback_popular(self, top_k: int) -> List[Dict]:
+    def _fallback_popular(self, top_k: int, exclude: Optional[set] = None) -> List[Dict]:
         """Return the globally most-accessed nodes as a fallback."""
-        popular = sorted(self.node_access_count.items(),
-                         key=lambda x: x[1], reverse=True)[:top_k]
+        exclude = exclude or set()
+        popular = [
+            item for item in sorted(self.node_access_count.items(),
+                                    key=lambda x: x[1], reverse=True)
+            if item[0] not in exclude
+        ][:top_k]
         total = sum(c for _, c in popular) or 1
         results = []
         for nid, cnt in popular:

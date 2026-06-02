@@ -71,12 +71,21 @@ impl SuggestionEngine {
 
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
+        let max_score = scored
+            .iter()
+            .map(|(score, _, _)| *score)
+            .fold(0.0_f32, f32::max);
+
         scored
             .into_iter()
             .take(limit)
             .map(|(score, n, reason)| FocusSuggestion {
                 node_id: n.id,
-                score,
+                score: if max_score > 0.0 {
+                    (score / max_score).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                },
                 content_preview: truncate(&n.content, 60),
                 reason,
             })

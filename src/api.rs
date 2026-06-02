@@ -1,6 +1,6 @@
 use crate::analytics::AnalyticsEngine;
 use crate::dashboard::export_html_dashboard;
-use crate::domain::{FocusDepth, NodeType, Position3};
+use crate::domain::{FocusDepth, FocusEvent, NodeType, Position3};
 use crate::dream::DreamEngine;
 use crate::export::{export_csv, export_dot, export_edges_csv, export_markdown};
 use crate::intelligence::SuggestionEngine;
@@ -16,6 +16,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -82,6 +83,7 @@ impl VaultRegistry {
 }
 
 pub type SharedVaultState = Arc<RwLock<VaultRegistry>>;
+pub type SharedActiveFocusState = Arc<RwLock<Option<ActiveFocusSession>>>;
 
 // ── App state (workspace + vault registry) ────────────────────────────────────
 
@@ -89,6 +91,7 @@ pub type SharedVaultState = Arc<RwLock<VaultRegistry>>;
 pub struct AppState {
     pub workspace: SharedWorkspace,
     pub vaults: SharedVaultState,
+    pub active_focus: SharedActiveFocusState,
 }
 
 impl FromRef<AppState> for SharedWorkspace {
@@ -100,6 +103,12 @@ impl FromRef<AppState> for SharedWorkspace {
 impl FromRef<AppState> for SharedVaultState {
     fn from_ref(state: &AppState) -> Self {
         state.vaults.clone()
+    }
+}
+
+impl FromRef<AppState> for SharedActiveFocusState {
+    fn from_ref(state: &AppState) -> Self {
+        state.active_focus.clone()
     }
 }
 
@@ -276,6 +285,36 @@ pub struct FocusRequest {
     pub node_id: String,
     pub seconds: f32,
     pub depth: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveFocusSession {
+    pub session_id: Uuid,
+    pub node_id: Uuid,
+    pub depth: FocusDepth,
+    pub started_at: DateTime<Utc>,
+    pub timeout_seconds: Option<u32>,
+}
+
+#[derive(Deserialize)]
+pub struct StartFocusRequest {
+    pub node_id: String,
+    pub depth: Option<String>,
+    pub timeout_seconds: Option<u32>,
+}
+
+#[derive(Serialize)]
+pub struct ActiveFocusResponse {
+    pub active: bool,
+    pub session_id: Option<String>,
+    pub node_id: Option<String>,
+    pub node_nickname: Option<String>,
+    pub node_preview: Option<String>,
+    pub depth: Option<String>,
+    pub started_at: Option<String>,
+    pub elapsed_seconds: u64,
+    pub timeout_seconds: Option<u32>,
+    pub remaining_seconds: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -951,6 +990,7 @@ type ApiResult<T> = Result<T, ApiError>;
 // ── Local settings ─────────────────────────────────────────────────────────────
 
 const NOTIFICATION_SETTINGS_PATH: &str = "data/settings.local.json";
+const ACTIVE_FOCUS_PATH: &str = "data/active_focus.local.json";
 
 fn load_notification_settings() -> NotificationSettings {
     std::fs::read_to_string(NOTIFICATION_SETTINGS_PATH)
@@ -1019,6 +1059,43 @@ fn normalize_notification_channel(value: Option<String>) -> String {
         "both" => "both".into(),
         _ => "app".into(),
     }
+}
+
+fn date_prefix(value: &str) -> &str {
+    value.get(0..10).unwrap_or(value)
+}
+
+fn load_active_focus_session() -> Option<ActiveFocusSession> {
+    std::fs::read_to_string(ACTIVE_FOCUS_PATH)
+        .ok()
+        .and_then(|data| serde_json::from_str::<ActiveFocusSession>(&data).ok())
+}
+
+fn save_active_focus_session(session: &ActiveFocusSession) -> ApiResult<()> {
+    if let Some(parent) = StdPath::new(ACTIVE_FOCUS_PATH).parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            ApiError(
+                format!("active focus directory error: {e}"),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            )
+        })?;
+    }
+    let json = serde_json::to_string_pretty(session).map_err(|e| {
+        ApiError(
+            format!("active focus serialize error: {e}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+    })?;
+    std::fs::write(ACTIVE_FOCUS_PATH, json).map_err(|e| {
+        ApiError(
+            format!("active focus save error: {e}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+    })
+}
+
+fn clear_active_focus_session_file() {
+    let _ = std::fs::remove_file(ACTIVE_FOCUS_PATH);
 }
 
 // ── Conversion helpers ─────────────────────────────────────────────────────────
@@ -1190,6 +1267,31 @@ fn default_nickname(content: &str) -> String {
     }
 }
 
+fn preview(content: &str, max_chars: usize) -> String {
+    let mut value: String = content.chars().take(max_chars).collect();
+    if content.chars().count() > max_chars {
+        value.push('…');
+    }
+    value
+}
+
+fn validated_text(value: String, field: &str, max_chars: usize) -> ApiResult<String> {
+    let trimmed = value.trim().to_string();
+    if trimmed.is_empty() {
+        return Err(ApiError(
+            format!("{field} required"),
+            StatusCode::BAD_REQUEST,
+        ));
+    }
+    if trimmed.chars().count() > max_chars {
+        return Err(ApiError(
+            format!("{field} must be at most {max_chars} characters"),
+            StatusCode::BAD_REQUEST,
+        ));
+    }
+    Ok(trimmed)
+}
+
 fn set_node_nickname(node: &mut crate::domain::NodeData, nickname: Option<String>) {
     let nickname = nickname
         .map(|value| value.trim().to_string())
@@ -1231,18 +1333,26 @@ fn set_node_custom_fields(
     }
 }
 
-fn set_node_schedule(node: &mut crate::domain::NodeData, schedule: Option<NodeScheduleRequest>) {
+fn set_node_schedule(
+    node: &mut crate::domain::NodeData,
+    schedule: Option<NodeScheduleRequest>,
+) -> ApiResult<()> {
     let Some(schedule) = schedule else {
-        return;
+        return Ok(());
     };
     let mode = schedule.mode.trim().to_lowercase();
     if mode.is_empty() || mode == "none" {
         node.metadata.remove("schedule");
-        return;
+        return Ok(());
     }
     let mode = match mode.as_str() {
         "once" | "daily" | "weekly" | "interval" | "custom_days" => mode,
-        _ => "once".to_string(),
+        _ => {
+            return Err(ApiError(
+                "schedule mode must be once, daily, weekly, interval, custom_days, or none".into(),
+                StatusCode::BAD_REQUEST,
+            ))
+        }
     };
     let status = schedule
         .status
@@ -1251,13 +1361,23 @@ fn set_node_schedule(node: &mut crate::domain::NodeData, schedule: Option<NodeSc
         .to_lowercase();
     let status = match status.as_str() {
         "active" | "paused" | "completed" => status,
-        _ => "active".to_string(),
+        _ => {
+            return Err(ApiError(
+                "schedule status must be active, paused, or completed".into(),
+                StatusCode::BAD_REQUEST,
+            ))
+        }
     };
     let days = schedule
         .days_of_week
         .unwrap_or_default()
         .into_iter()
         .filter(|day| *day <= 6)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let days = days
+        .into_iter()
         .map(serde_json::Value::from)
         .collect::<Vec<_>>();
     let mut map = serde_json::Map::new();
@@ -1279,12 +1399,22 @@ fn set_node_schedule(node: &mut crate::domain::NodeData, schedule: Option<NodeSc
         .time_of_day
         .filter(|value| !value.trim().is_empty())
     {
+        let time_of_day = time_of_day.trim().to_string();
+        chrono::NaiveTime::parse_from_str(&time_of_day, "%H:%M").map_err(|_| {
+            ApiError(
+                "schedule time_of_day must be HH:MM".into(),
+                StatusCode::BAD_REQUEST,
+            )
+        })?;
         map.insert(
             "time_of_day".into(),
-            serde_json::Value::String(time_of_day.trim().to_string()),
+            serde_json::Value::String(time_of_day),
         );
     }
-    if let Some(interval) = schedule.interval_minutes.filter(|value| *value > 0) {
+    if let Some(interval) = schedule
+        .interval_minutes
+        .filter(|value| (1..=10_080).contains(value))
+    {
         map.insert("interval_minutes".into(), serde_json::Value::from(interval));
     }
     if !days.is_empty() {
@@ -1296,10 +1426,11 @@ fn set_node_schedule(node: &mut crate::domain::NodeData, schedule: Option<NodeSc
     );
     map.insert(
         "reminder_minutes_before".into(),
-        serde_json::Value::from(schedule.reminder_minutes_before.unwrap_or(10)),
+        serde_json::Value::from(schedule.reminder_minutes_before.unwrap_or(10).min(1_440)),
     );
     node.metadata
         .insert("schedule".to_string(), serde_json::Value::Object(map));
+    Ok(())
 }
 
 fn parse_node_type(s: &str) -> NodeType {
@@ -1323,9 +1454,92 @@ fn parse_focus_depth(s: &str) -> FocusDepth {
     match s.to_lowercase().as_str() {
         "read" => FocusDepth::Read,
         "edit" | "think" => FocusDepth::Edit,
-        "deep_work" | "deep-work" => FocusDepth::DeepWork,
+        "deep_work" | "deep-work" | "deepwork" => FocusDepth::DeepWork,
         _ => FocusDepth::Glance,
     }
+}
+
+fn focus_depth_response(depth: FocusDepth) -> &'static str {
+    match depth {
+        FocusDepth::Glance => "Glance",
+        FocusDepth::Read => "Read",
+        FocusDepth::Edit => "Edit",
+        FocusDepth::DeepWork => "DeepWork",
+    }
+}
+
+fn active_focus_response(
+    session: Option<&ActiveFocusSession>,
+    ws: &SilentNodeWorkspace,
+) -> ActiveFocusResponse {
+    let Some(session) = session else {
+        return ActiveFocusResponse {
+            active: false,
+            session_id: None,
+            node_id: None,
+            node_nickname: None,
+            node_preview: None,
+            depth: None,
+            started_at: None,
+            elapsed_seconds: 0,
+            timeout_seconds: None,
+            remaining_seconds: None,
+        };
+    };
+
+    let now = Utc::now();
+    let elapsed_seconds = (now - session.started_at).num_seconds().max(0) as u64;
+    let remaining_seconds = session
+        .timeout_seconds
+        .map(|timeout| timeout as i64 - elapsed_seconds as i64);
+    let node = ws.graph.get_node(session.node_id);
+    ActiveFocusResponse {
+        active: true,
+        session_id: Some(session.session_id.to_string()),
+        node_id: Some(session.node_id.to_string()),
+        node_nickname: node.map(node_nickname),
+        node_preview: node.map(|n| preview(&n.content, 90)),
+        depth: Some(focus_depth_response(session.depth).to_string()),
+        started_at: Some(session.started_at.to_rfc3339()),
+        elapsed_seconds,
+        timeout_seconds: session.timeout_seconds,
+        remaining_seconds,
+    }
+}
+
+async fn finish_active_focus(
+    app: &AppState,
+    limit_to_timeout: bool,
+) -> ApiResult<Option<FocusEvent>> {
+    let session = {
+        let mut active = app.active_focus.write().await;
+        active.take()
+    };
+    let Some(session) = session else {
+        return Ok(None);
+    };
+    let elapsed = (Utc::now() - session.started_at).num_seconds().max(1) as f32;
+    let duration = if limit_to_timeout {
+        session
+            .timeout_seconds
+            .map(|timeout| timeout.max(1) as f32)
+            .unwrap_or(elapsed)
+            .min(elapsed)
+    } else {
+        elapsed
+    };
+    let (event, snapshot) = {
+        let mut ws = app.workspace.write().await;
+        if ws.graph.get_node(session.node_id).is_none() {
+            clear_active_focus_session_file();
+            return Ok(None);
+        }
+        let event = ws.record_focus(session.node_id, duration, session.depth)?;
+        (event, ws.snapshot())
+    };
+    save_current_snapshot(app, snapshot, "active focus").await?;
+    clear_active_focus_session_file();
+    Ok(Some(event))
 }
 
 async fn save_current_snapshot(
@@ -1492,15 +1706,16 @@ async fn post_node(
     State(app): State<AppState>,
     Json(req): Json<CreateNodeRequest>,
 ) -> ApiResult<impl IntoResponse> {
+    let content = validated_text(req.content, "content", 50_000)?;
     let node_type = req
         .node_type
         .as_deref()
         .map(parse_node_type)
         .unwrap_or(NodeType::Idea);
-    let mut node = crate::domain::NodeData::new(node_type, req.content);
+    let mut node = crate::domain::NodeData::new(node_type, content);
     set_node_nickname(&mut node, req.nickname);
     set_node_custom_fields(&mut node, req.custom_type, req.custom_color);
-    set_node_schedule(&mut node, req.schedule);
+    set_node_schedule(&mut node, req.schedule)?;
     node.position = Position3 {
         x: req.x.unwrap_or(0.0),
         y: req.y.unwrap_or(0.0),
@@ -1548,7 +1763,30 @@ struct AttachmentEntry {
     is_image: bool,
 }
 
-async fn get_attachments(Path(id): Path<String>) -> impl IntoResponse {
+async fn get_attachments(
+    State(ws): State<SharedWorkspace>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let node_id = match Uuid::parse_str(&id) {
+        Ok(node_id) => node_id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid UUID"})),
+            )
+                .into_response()
+        }
+    };
+    {
+        let ws = ws.read().await;
+        if ws.graph.get_node(node_id).is_none() {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "node not found"})),
+            )
+                .into_response();
+        }
+    }
     let dir = attachment_dir(&id);
     if !dir.exists() {
         return Json(Vec::<AttachmentEntry>::new()).into_response();
@@ -1559,7 +1797,10 @@ async fn get_attachments(Path(id): Path<String>) -> impl IntoResponse {
             let filename = entry.file_name().to_string_lossy().to_string();
             let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
             let ext = filename.rsplit('.').next().unwrap_or("").to_lowercase();
-            let is_image = matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg");
+            let is_image = matches!(
+                ext.as_str(),
+                "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg"
+            );
             entries.push(AttachmentEntry {
                 url: format!("/api/nodes/{}/attachments/{}", id, filename),
                 filename,
@@ -1573,13 +1814,37 @@ async fn get_attachments(Path(id): Path<String>) -> impl IntoResponse {
 }
 
 async fn post_attachment(
+    State(ws): State<SharedWorkspace>,
     Path(id): Path<String>,
     mut multipart: axum::extract::Multipart,
 ) -> impl IntoResponse {
+    let node_id = match Uuid::parse_str(&id) {
+        Ok(node_id) => node_id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid UUID"})),
+            )
+                .into_response()
+        }
+    };
+    {
+        let ws = ws.read().await;
+        if ws.graph.get_node(node_id).is_none() {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "node not found"})),
+            )
+                .into_response();
+        }
+    }
     let dir = attachment_dir(&id);
     if let Err(e) = std::fs::create_dir_all(&dir) {
-        return (StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()}))).into_response();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response();
     }
     let mut saved = Vec::new();
     while let Ok(Some(field)) = multipart.next_field().await {
@@ -1587,55 +1852,124 @@ async fn post_attachment(
             Some(f) if !f.is_empty() => f,
             _ => continue,
         };
-        let safe_name: String = filename.chars()
-            .map(|c| if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
+        let safe_name: String = filename
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
         let path = dir.join(&safe_name);
         match field.bytes().await {
             Ok(data) => {
                 if let Err(e) = std::fs::write(&path, &data) {
-                    return (StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"error": e.to_string()}))).into_response();
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": e.to_string()})),
+                    )
+                        .into_response();
                 }
                 saved.push(safe_name);
             }
-            Err(e) => return (StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": e.to_string()})),
+                )
+                    .into_response()
+            }
         }
     }
     Json(serde_json::json!({"uploaded": saved})).into_response()
 }
 
-async fn delete_attachment(Path((id, filename)): Path<(String, String)>) -> impl IntoResponse {
-    let safe: String = filename.chars()
-        .map(|c| if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
+async fn delete_attachment(
+    State(ws): State<SharedWorkspace>,
+    Path((id, filename)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let node_id = match Uuid::parse_str(&id) {
+        Ok(node_id) => node_id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid UUID"})),
+            )
+                .into_response()
+        }
+    };
+    {
+        let ws = ws.read().await;
+        if ws.graph.get_node(node_id).is_none() {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "node not found"})),
+            )
+                .into_response();
+        }
+    }
+    let safe: String = filename
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     let path = attachment_dir(&id).join(&safe);
     if path.exists() {
         let _ = std::fs::remove_file(&path);
         Json(serde_json::json!({"deleted": safe})).into_response()
     } else {
-        (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "not found"}))).into_response()
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "not found"})),
+        )
+            .into_response()
     }
 }
 
-async fn serve_attachment(Path((id, filename)): Path<(String, String)>) -> impl IntoResponse {
-    let safe: String = filename.chars()
-        .map(|c| if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
+async fn serve_attachment(
+    State(ws): State<SharedWorkspace>,
+    Path((id, filename)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let node_id = match Uuid::parse_str(&id) {
+        Ok(node_id) => node_id,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    {
+        let ws = ws.read().await;
+        if ws.graph.get_node(node_id).is_none() {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+    }
+    let safe: String = filename
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     let path = attachment_dir(&id).join(&safe);
     match std::fs::read(&path) {
         Ok(data) => {
             let ext = safe.rsplit('.').next().unwrap_or("").to_lowercase();
             let mime = match ext.as_str() {
-                "png"  => "image/png",
+                "png" => "image/png",
                 "jpg" | "jpeg" => "image/jpeg",
-                "gif"  => "image/gif",
+                "gif" => "image/gif",
                 "webp" => "image/webp",
-                "svg"  => "image/svg+xml",
-                "pdf"  => "application/pdf",
-                "mp4"  => "video/mp4",
-                _      => "application/octet-stream",
+                "svg" => "image/svg+xml",
+                "pdf" => "application/pdf",
+                "mp4" => "video/mp4",
+                _ => "application/octet-stream",
             };
             ([(axum::http::header::CONTENT_TYPE, mime)], data).into_response()
         }
@@ -1649,6 +1983,16 @@ async fn delete_node(
 ) -> ApiResult<impl IntoResponse> {
     let node_id = Uuid::parse_str(&id)
         .map_err(|_| ApiError("invalid UUID".into(), StatusCode::BAD_REQUEST))?;
+    {
+        let mut active = app.active_focus.write().await;
+        if active
+            .as_ref()
+            .is_some_and(|session| session.node_id == node_id)
+        {
+            *active = None;
+            clear_active_focus_session_file();
+        }
+    }
     let snapshot = {
         let mut ws = app.workspace.write().await;
         ws.graph.remove_node(node_id)?;
@@ -1696,7 +2040,7 @@ async fn put_node(
             }
         }
         set_node_custom_fields(node, req.custom_type, req.custom_color);
-        set_node_schedule(node, req.schedule);
+        set_node_schedule(node, req.schedule)?;
         ws.snapshot()
     };
     save_current_snapshot(&app, snapshot, "node update").await?;
@@ -1714,7 +2058,13 @@ async fn delete_focus_session(
 ) -> impl IntoResponse {
     let sid = match Uuid::parse_str(&session_id) {
         Ok(id) => id,
-        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"invalid UUID"}))).into_response(),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error":"invalid UUID"})),
+            )
+                .into_response()
+        }
     };
     let (found, snapshot) = {
         let mut ws = app.workspace.write().await;
@@ -1722,10 +2072,91 @@ async fn delete_focus_session(
         (found, ws.snapshot())
     };
     if !found {
-        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error":"session not found"}))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error":"session not found"})),
+        )
+            .into_response();
     }
     let _ = save_current_snapshot(&app, snapshot, "focus-delete").await;
     Json(serde_json::json!({"deleted": session_id})).into_response()
+}
+
+async fn get_active_focus(State(app): State<AppState>) -> ApiResult<Json<ActiveFocusResponse>> {
+    let should_timeout = {
+        let active = app.active_focus.read().await;
+        active.as_ref().is_some_and(|session| {
+            session.timeout_seconds.is_some_and(|timeout| {
+                (Utc::now() - session.started_at).num_seconds().max(0) >= timeout as i64
+            })
+        })
+    };
+    if should_timeout {
+        finish_active_focus(&app, true).await?;
+    }
+
+    let active = app.active_focus.read().await.clone();
+    let ws = app.workspace.read().await;
+    if let Some(session) = active.as_ref() {
+        if ws.graph.get_node(session.node_id).is_none() {
+            drop(ws);
+            let mut active = app.active_focus.write().await;
+            *active = None;
+            clear_active_focus_session_file();
+            let ws = app.workspace.read().await;
+            return Ok(Json(active_focus_response(None, &ws)));
+        }
+    }
+    Ok(Json(active_focus_response(active.as_ref(), &ws)))
+}
+
+async fn post_active_focus_start(
+    State(app): State<AppState>,
+    Json(req): Json<StartFocusRequest>,
+) -> ApiResult<Json<ActiveFocusResponse>> {
+    let node_id = Uuid::parse_str(&req.node_id)
+        .map_err(|_| ApiError("invalid UUID".into(), StatusCode::BAD_REQUEST))?;
+    let depth = req
+        .depth
+        .as_deref()
+        .map(parse_focus_depth)
+        .unwrap_or(FocusDepth::DeepWork);
+    let timeout_seconds = req
+        .timeout_seconds
+        .filter(|value| *value > 0)
+        .map(|v| v.min(86_400));
+
+    {
+        let ws = app.workspace.read().await;
+        if ws.graph.get_node(node_id).is_none() {
+            return Err(ApiError("node not found".into(), StatusCode::NOT_FOUND));
+        }
+    }
+
+    finish_active_focus(&app, false).await?;
+
+    let session = ActiveFocusSession {
+        session_id: Uuid::new_v4(),
+        node_id,
+        depth,
+        started_at: Utc::now(),
+        timeout_seconds,
+    };
+    save_active_focus_session(&session)?;
+    {
+        let mut active = app.active_focus.write().await;
+        *active = Some(session.clone());
+    }
+    let ws = app.workspace.read().await;
+    Ok(Json(active_focus_response(Some(&session), &ws)))
+}
+
+async fn post_active_focus_stop(
+    State(app): State<AppState>,
+) -> ApiResult<Json<ActiveFocusResponse>> {
+    finish_active_focus(&app, false).await?;
+    let ws = app.workspace.read().await;
+    Ok(Json(active_focus_response(None, &ws)))
 }
 
 async fn post_focus(
@@ -1734,6 +2165,12 @@ async fn post_focus(
 ) -> ApiResult<impl IntoResponse> {
     let node_id = Uuid::parse_str(&req.node_id)
         .map_err(|_| ApiError("invalid UUID".into(), StatusCode::BAD_REQUEST))?;
+    if !req.seconds.is_finite() || req.seconds <= 0.0 || req.seconds > 86_400.0 {
+        return Err(ApiError(
+            "seconds must be between 1 and 86400".into(),
+            StatusCode::BAD_REQUEST,
+        ));
+    }
     let depth = req
         .depth
         .as_deref()
@@ -1749,18 +2186,23 @@ async fn post_focus(
 }
 
 async fn post_journal(
-    State(ws): State<SharedWorkspace>,
+    State(app): State<AppState>,
     Json(req): Json<JournalRequest>,
-) -> impl IntoResponse {
-    let mut ws = ws.write().await;
-    let entry = ws.add_journal_entry(req.text, req.season);
-    Json(JournalEntryResponse {
+) -> ApiResult<impl IntoResponse> {
+    let text = validated_text(req.text, "text", 20_000)?;
+    let (entry, snapshot) = {
+        let mut ws = app.workspace.write().await;
+        let entry = ws.add_journal_entry(text, req.season);
+        (entry.clone(), ws.snapshot())
+    };
+    save_current_snapshot(&app, snapshot, "journal").await?;
+    Ok(Json(JournalEntryResponse {
         id: entry.id.to_string(),
         content: entry.content.clone(),
         timestamp: entry.timestamp.to_rfc3339(),
         season: entry.season.clone(),
         linked_nodes: entry.linked_nodes.iter().map(|id| id.to_string()).collect(),
-    })
+    }))
 }
 
 async fn get_journal(State(ws): State<SharedWorkspace>) -> impl IntoResponse {
@@ -1843,7 +2285,7 @@ async fn get_resonances(
     let ws = ws.read().await;
     let mut engine = ResonanceChamberEngine::new();
     if let Some(t) = q.threshold {
-        engine.min_similarity = t;
+        engine.min_similarity = t.clamp(0.0, 1.0);
     }
     let nodes: Vec<&crate::domain::NodeData> = ws.graph.nodes().collect();
     let pairs = engine.find_resonances(&nodes);
@@ -1865,7 +2307,7 @@ async fn get_suggestions(
 ) -> impl IntoResponse {
     let ws = ws.read().await;
     let engine = SuggestionEngine::new();
-    let limit = q.limit.unwrap_or(10);
+    let limit = q.limit.unwrap_or(10).clamp(1, 100);
     let suggestions = engine.suggest_next_focus(&ws, limit);
     let resp: Vec<SuggestionResponse> = suggestions
         .into_iter()
@@ -1888,7 +2330,7 @@ async fn get_related(
     let node_id = Uuid::parse_str(&id)
         .map_err(|_| ApiError("invalid UUID".into(), StatusCode::BAD_REQUEST))?;
     let engine = SuggestionEngine::new();
-    let limit = q.limit.unwrap_or(10);
+    let limit = q.limit.unwrap_or(10).clamp(1, 100);
     let related = engine.suggest_related(&ws, node_id, limit);
     let resp: Vec<serde_json::Value> = related
         .into_iter()
@@ -1926,14 +2368,19 @@ async fn get_clusters(
 }
 
 async fn post_thought(
-    State(ws): State<SharedWorkspace>,
+    State(app): State<AppState>,
     Json(req): Json<AddThoughtRequest>,
 ) -> ApiResult<impl IntoResponse> {
-    let mut ws = ws.write().await;
-    let result = ws.materialize_thought(&MaterializationEngine::new(), &req.text)?;
-    if let Some(node) = ws.graph.get_node_mut(result.node_id) {
-        set_node_nickname(node, req.nickname);
-    }
+    let text = validated_text(req.text, "text", 50_000)?;
+    let (result, snapshot) = {
+        let mut ws = app.workspace.write().await;
+        let result = ws.materialize_thought(&MaterializationEngine::new(), &text)?;
+        if let Some(node) = ws.graph.get_node_mut(result.node_id) {
+            set_node_nickname(node, req.nickname);
+        }
+        (result, ws.snapshot())
+    };
+    save_current_snapshot(&app, snapshot, "thought").await?;
     Ok(Json(serde_json::json!({
         "node_id": result.node_id.to_string(),
         "node_type": format!("{:?}", result.node_type),
@@ -2152,58 +2599,108 @@ async fn post_thought_chain(
 
 async fn post_void_toggle(
     Path(id): Path<String>,
-    State(ws): State<SharedWorkspace>,
+    State(app): State<AppState>,
 ) -> ApiResult<impl IntoResponse> {
-    let mut ws = ws.write().await;
     let node_id = Uuid::parse_str(&id)
         .map_err(|_| ApiError("invalid UUID".into(), StatusCode::BAD_REQUEST))?;
-    let is_void = ws
-        .graph
-        .get_node(node_id)
-        .map(|n| n.is_void)
-        .unwrap_or(false);
-    if is_void {
-        ws.extract_from_void(node_id)?;
-        Ok(Json(serde_json::json!({"voided": false})))
-    } else {
-        ws.send_to_void(node_id)?;
-        Ok(Json(serde_json::json!({"voided": true})))
-    }
+    let (voided, snapshot) = {
+        let mut ws = app.workspace.write().await;
+        let is_void = ws
+            .graph
+            .get_node(node_id)
+            .map(|n| n.is_void)
+            .ok_or_else(|| ApiError("node not found".into(), StatusCode::NOT_FOUND))?;
+        if is_void {
+            ws.extract_from_void(node_id)?;
+            (false, ws.snapshot())
+        } else {
+            ws.send_to_void(node_id)?;
+            (true, ws.snapshot())
+        }
+    };
+    save_current_snapshot(&app, snapshot, "void").await?;
+    Ok(Json(serde_json::json!({"voided": voided})))
 }
 
 async fn post_fossilize(
     Path(id): Path<String>,
-    State(ws): State<SharedWorkspace>,
+    State(app): State<AppState>,
 ) -> ApiResult<impl IntoResponse> {
-    let mut ws = ws.write().await;
     let node_id = Uuid::parse_str(&id)
         .map_err(|_| ApiError("invalid UUID".into(), StatusCode::BAD_REQUEST))?;
-    ws.fossilize_node(node_id)?;
+    let snapshot = {
+        let mut ws = app.workspace.write().await;
+        ws.fossilize_node(node_id)?;
+        ws.snapshot()
+    };
+    save_current_snapshot(&app, snapshot, "fossilize").await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn post_excavate(
     Path(id): Path<String>,
-    State(ws): State<SharedWorkspace>,
+    State(app): State<AppState>,
 ) -> ApiResult<impl IntoResponse> {
-    let mut ws = ws.write().await;
     let node_id = Uuid::parse_str(&id)
         .map_err(|_| ApiError("invalid UUID".into(), StatusCode::BAD_REQUEST))?;
-    ws.excavate_node(node_id)?;
+    let snapshot = {
+        let mut ws = app.workspace.write().await;
+        ws.excavate_node(node_id)?;
+        ws.snapshot()
+    };
+    save_current_snapshot(&app, snapshot, "excavate").await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn post_revive(
     Path(id): Path<String>,
-    State(ws): State<SharedWorkspace>,
+    State(app): State<AppState>,
 ) -> ApiResult<impl IntoResponse> {
-    let mut ws = ws.write().await;
     let node_id = Uuid::parse_str(&id)
         .map_err(|_| ApiError("invalid UUID".into(), StatusCode::BAD_REQUEST))?;
-    let engine = crate::entropy::EntropyEngine::new();
-    ws.reverse_entropy(&engine, node_id);
-    ws.revive_node(node_id)?;
+    let snapshot = {
+        let mut ws = app.workspace.write().await;
+        let engine = crate::entropy::EntropyEngine::new();
+        ws.reverse_entropy(&engine, node_id);
+        ws.revive_node(node_id)?;
+        ws.snapshot()
+    };
+    save_current_snapshot(&app, snapshot, "revive").await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_nodes_bulk(
+    State(app): State<AppState>,
+    Json(ids): Json<Vec<String>>,
+) -> ApiResult<impl IntoResponse> {
+    let parsed = ids
+        .iter()
+        .filter_map(|id| Uuid::parse_str(id).ok())
+        .collect::<HashSet<_>>();
+    {
+        let mut active = app.active_focus.write().await;
+        if active
+            .as_ref()
+            .is_some_and(|session| parsed.contains(&session.node_id))
+        {
+            *active = None;
+            clear_active_focus_session_file();
+        }
+    }
+    let (deleted, snapshot) = {
+        let mut ws = app.workspace.write().await;
+        let mut deleted = 0usize;
+        for uid in parsed {
+            if ws.remove_node(uid).is_ok() {
+                deleted += 1;
+            }
+        }
+        (deleted, ws.snapshot())
+    };
+    if deleted > 0 {
+        save_current_snapshot(&app, snapshot, "bulk delete").await?;
+    }
+    Ok(Json(serde_json::json!({"deleted": deleted})))
 }
 
 async fn post_connect(
@@ -2334,22 +2831,6 @@ async fn get_shadow_projects(State(ws): State<SharedWorkspace>) -> impl IntoResp
     Json(resp)
 }
 
-async fn delete_nodes_bulk(
-    State(ws): State<SharedWorkspace>,
-    Json(ids): Json<Vec<String>>,
-) -> ApiResult<impl IntoResponse> {
-    let mut ws = ws.write().await;
-    let mut deleted = 0usize;
-    for id_str in &ids {
-        if let Ok(uid) = Uuid::parse_str(id_str) {
-            if ws.remove_node(uid).is_ok() {
-                deleted += 1;
-            }
-        }
-    }
-    Ok(Json(serde_json::json!({"deleted": deleted})))
-}
-
 // ── New feature handlers ───────────────────────────────────────────────────────
 
 async fn get_heatmap(
@@ -2357,7 +2838,7 @@ async fn get_heatmap(
     Query(q): Query<HeatmapQuery>,
 ) -> impl IntoResponse {
     let ws = ws.read().await;
-    let days = q.days.unwrap_or(30);
+    let days = q.days.unwrap_or(30).clamp(1, 3650);
     let heatmap = ws.thought_heatmap(days);
     let loops = ws.obsessive_loops();
     let neglected = ws.neglected_regions();
@@ -2428,7 +2909,7 @@ async fn get_mirror(
     Query(q): Query<MirrorQuery>,
 ) -> impl IntoResponse {
     let ws = ws.read().await;
-    let days = q.days.unwrap_or(30);
+    let days = q.days.unwrap_or(30).clamp(1, 3650);
     let portrait = ws.cognitive_mirror(days);
 
     let gaps: Vec<PriorityGapResponse> = portrait
@@ -2598,14 +3079,22 @@ async fn get_souls(State(ws): State<SharedWorkspace>) -> impl IntoResponse {
                 .graph
                 .get_node(s.project_id)
                 .map(|n| {
-                    let nick = n.metadata.get("nickname")
+                    let nick = n
+                        .metadata
+                        .get("nickname")
                         .and_then(|v| v.as_str())
                         .map(str::trim)
                         .filter(|s| !s.is_empty());
                     if let Some(name) = nick {
                         name.to_string()
                     } else {
-                        n.content.lines().next().unwrap_or("").chars().take(40).collect()
+                        n.content
+                            .lines()
+                            .next()
+                            .unwrap_or("")
+                            .chars()
+                            .take(40)
+                            .collect()
                     }
                 })
                 .unwrap_or_default();
@@ -2699,7 +3188,7 @@ async fn get_trail(
     Query(q): Query<TrailQuery>,
 ) -> impl IntoResponse {
     let ws = ws.read().await;
-    let hours = q.hours.unwrap_or(48);
+    let hours = q.hours.unwrap_or(48).clamp(1, 24 * 365 * 10);
     let trail = ws.recent_trail(hours);
     let resp: Vec<FocusTrailResponse> = trail
         .iter()
@@ -3577,11 +4066,14 @@ async fn get_temporal_compare(
     }))
 }
 
-async fn post_temporal_snapshot(State(ws): State<SharedWorkspace>) -> impl IntoResponse {
-    let mut ws = ws.write().await;
-    ws.snapshot_all_nodes();
-    let count = ws.temporal_snapshot_count();
-    Json(serde_json::json!({ "ok": true, "total_snapshots": count }))
+async fn post_temporal_snapshot(State(app): State<AppState>) -> ApiResult<impl IntoResponse> {
+    let (count, snapshot) = {
+        let mut ws = app.workspace.write().await;
+        ws.snapshot_all_nodes();
+        (ws.temporal_snapshot_count(), ws.snapshot())
+    };
+    save_current_snapshot(&app, snapshot, "temporal snapshot").await?;
+    Ok(Json(serde_json::json!({ "ok": true, "total_snapshots": count })))
 }
 
 async fn get_void_zones(State(ws): State<SharedWorkspace>) -> impl IntoResponse {
@@ -3628,24 +4120,32 @@ async fn get_void_zones(State(ws): State<SharedWorkspace>) -> impl IntoResponse 
 }
 
 async fn post_fulfill_contract(
-    State(ws): State<SharedWorkspace>,
+    State(app): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
-    let mut ws = ws.write().await;
     let node_id = Uuid::parse_str(&id)
         .map_err(|_| ApiError("invalid UUID".into(), StatusCode::BAD_REQUEST))?;
-    ws.fulfill_contract(node_id)?;
+    let snapshot = {
+        let mut ws = app.workspace.write().await;
+        ws.fulfill_contract(node_id)?;
+        ws.snapshot()
+    };
+    save_current_snapshot(&app, snapshot, "contract fulfill").await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn post_release_contract(
-    State(ws): State<SharedWorkspace>,
+    State(app): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
-    let mut ws = ws.write().await;
     let node_id = Uuid::parse_str(&id)
         .map_err(|_| ApiError("invalid UUID".into(), StatusCode::BAD_REQUEST))?;
-    ws.release_contract(node_id)?;
+    let snapshot = {
+        let mut ws = app.workspace.write().await;
+        ws.release_contract(node_id)?;
+        ws.snapshot()
+    };
+    save_current_snapshot(&app, snapshot, "contract release").await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -3688,7 +4188,7 @@ async fn get_resonance_chambers(
     Query(q): Query<ResonanceChamberQuery>,
 ) -> impl IntoResponse {
     let ws = ws.read().await;
-    let threshold = q.threshold.unwrap_or(0.5);
+    let threshold = q.threshold.unwrap_or(0.5).clamp(0.0, 1.0);
     let chambers = ws.open_resonance_chambers(threshold);
     let resp: Vec<ResonanceChamberResponse> = chambers
         .iter()
@@ -3719,36 +4219,48 @@ async fn get_resonance_chambers(
 }
 
 async fn post_illuminate_shadow(
-    State(ws): State<SharedWorkspace>,
+    State(app): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
-    let mut ws = ws.write().await;
     let node_id = Uuid::parse_str(&id)
         .map_err(|_| ApiError("invalid UUID".into(), StatusCode::BAD_REQUEST))?;
-    ws.illuminate_shadow(node_id)?;
+    let snapshot = {
+        let mut ws = app.workspace.write().await;
+        ws.illuminate_shadow(node_id)?;
+        ws.snapshot()
+    };
+    save_current_snapshot(&app, snapshot, "shadow illuminate").await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn post_name_shadow(
-    State(ws): State<SharedWorkspace>,
+    State(app): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<NameShadowRequest>,
 ) -> ApiResult<impl IntoResponse> {
-    let mut ws = ws.write().await;
     let node_id = Uuid::parse_str(&id)
         .map_err(|_| ApiError("invalid UUID".into(), StatusCode::BAD_REQUEST))?;
-    ws.name_shadow(node_id, Some(req.name))?;
+    let snapshot = {
+        let mut ws = app.workspace.write().await;
+        ws.name_shadow(node_id, Some(req.name))?;
+        ws.snapshot()
+    };
+    save_current_snapshot(&app, snapshot, "shadow name").await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn post_release_shadow(
-    State(ws): State<SharedWorkspace>,
+    State(app): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
-    let mut ws = ws.write().await;
     let node_id = Uuid::parse_str(&id)
         .map_err(|_| ApiError("invalid UUID".into(), StatusCode::BAD_REQUEST))?;
-    ws.release_shadow(node_id)?;
+    let snapshot = {
+        let mut ws = app.workspace.write().await;
+        ws.release_shadow(node_id)?;
+        ws.snapshot()
+    };
+    save_current_snapshot(&app, snapshot, "shadow release").await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -4127,11 +4639,10 @@ async fn get_membrane(State(ws): State<SharedWorkspace>) -> impl IntoResponse {
 }
 
 async fn post_membrane_rule(
-    State(ws): State<SharedWorkspace>,
+    State(app): State<AppState>,
     Json(req): Json<AddMembraneRuleRequest>,
-) -> impl IntoResponse {
+) -> ApiResult<impl IntoResponse> {
     use crate::membrane::{CrossingDirection, MembraneRule};
-    let mut ws = ws.write().await;
     let dir = match req.direction.as_deref().unwrap_or("both") {
         "inbound" => CrossingDirection::Inbound,
         "outbound" => CrossingDirection::Outbound,
@@ -4147,18 +4658,27 @@ async fn post_membrane_rule(
         rule = rule.with_description(desc);
     }
     let id = rule.id.to_string();
-    ws.membrane.add_rule(rule);
-    (StatusCode::CREATED, Json(serde_json::json!({ "id": id })))
+    let snapshot = {
+        let mut ws = app.workspace.write().await;
+        ws.membrane.add_rule(rule);
+        ws.snapshot()
+    };
+    save_current_snapshot(&app, snapshot, "membrane rule").await?;
+    Ok((StatusCode::CREATED, Json(serde_json::json!({ "id": id }))))
 }
 
 async fn delete_membrane_rule(
-    State(ws): State<SharedWorkspace>,
+    State(app): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
-    let mut ws = ws.write().await;
     let rule_id = Uuid::parse_str(&id)
         .map_err(|_| ApiError("invalid UUID".into(), StatusCode::BAD_REQUEST))?;
-    ws.membrane.remove_rule(rule_id);
+    let snapshot = {
+        let mut ws = app.workspace.write().await;
+        ws.membrane.remove_rule(rule_id);
+        ws.snapshot()
+    };
+    save_current_snapshot(&app, snapshot, "membrane rule delete").await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -4185,14 +4705,21 @@ async fn get_processes(State(ws): State<SharedWorkspace>) -> impl IntoResponse {
 }
 
 async fn post_process_link(
-    State(ws): State<SharedWorkspace>,
+    State(app): State<AppState>,
     Path(pid): Path<i64>,
     Json(req): Json<LinkProcessRequest>,
 ) -> ApiResult<impl IntoResponse> {
-    let mut ws = ws.write().await;
     let node_id = Uuid::parse_str(&req.node_id)
         .map_err(|_| ApiError("invalid UUID".into(), StatusCode::BAD_REQUEST))?;
-    ws.processes.link_to_node(pid, node_id);
+    let snapshot = {
+        let mut ws = app.workspace.write().await;
+        if ws.graph.get_node(node_id).is_none() {
+            return Err(ApiError("node not found".into(), StatusCode::NOT_FOUND));
+        }
+        ws.processes.link_to_node(pid, node_id);
+        ws.snapshot()
+    };
+    save_current_snapshot(&app, snapshot, "process link").await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -4331,6 +4858,9 @@ async fn post_switch_vault(
     Json(req): Json<SwitchVaultRequest>,
 ) -> impl IntoResponse {
     let name = req.name.trim().to_string();
+    if let Err(err) = finish_active_focus(&app, false).await {
+        return err.into_response();
+    }
     let sqlite_path = {
         let reg = app.vaults.read().await;
         match reg.vaults.iter().find(|v| v.name == name) {
@@ -4380,10 +4910,13 @@ async fn delete_vault(State(app): State<AppState>, Path(name): Path<String>) -> 
     }
     let vault_path = match reg.vaults.iter().find(|v| v.name == name) {
         Some(v) => PathBuf::from(&v.path),
-        None => return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "vault not found"})),
-        ).into_response(),
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "vault not found"})),
+            )
+                .into_response()
+        }
     };
     reg.vaults.retain(|v| v.name != name);
     reg.save();
@@ -4771,8 +5304,14 @@ pub fn build_router(app: AppState) -> Router {
             get(get_node).delete(delete_node).put(put_node),
         )
         .route("/nodes/:id/related", get(get_related))
-        .route("/nodes/:id/attachments", get(get_attachments).post(post_attachment))
-        .route("/nodes/:id/attachments/:filename", axum::routing::delete(delete_attachment).get(serve_attachment))
+        .route(
+            "/nodes/:id/attachments",
+            get(get_attachments).post(post_attachment),
+        )
+        .route(
+            "/nodes/:id/attachments/:filename",
+            axum::routing::delete(delete_attachment).get(serve_attachment),
+        )
         .route("/nodes/:id/void", axum::routing::post(post_void_toggle))
         .route("/nodes/:id/fossilize", axum::routing::post(post_fossilize))
         .route("/nodes/:id/excavate", axum::routing::post(post_excavate))
@@ -4782,7 +5321,15 @@ pub fn build_router(app: AppState) -> Router {
         // cognitive interaction
         .route("/thought", post(post_thought))
         .route("/focus", post(post_focus))
-        .route("/focus/:session_id", axum::routing::delete(delete_focus_session))
+        .route(
+            "/focus/active",
+            get(get_active_focus).post(post_active_focus_start),
+        )
+        .route("/focus/active/stop", post(post_active_focus_stop))
+        .route(
+            "/focus/:session_id",
+            axum::routing::delete(delete_focus_session),
+        )
         .route("/journal", get(get_journal).post(post_journal))
         .route("/tasks", get(get_tasks).post(post_task))
         .route(
@@ -4925,6 +5472,20 @@ fn run_ml_cli(args: &[&str]) -> Result<serde_json::Value, String> {
         .args(args)
         .output()
         .map_err(|e| format!("python executable not found: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(format!(
+            "ml command failed with status {}: {}{}",
+            output.status,
+            stderr.trim(),
+            if stdout.trim().is_empty() {
+                String::new()
+            } else {
+                format!("\nstdout: {}", stdout.trim())
+            }
+        ));
+    }
     let stdout = String::from_utf8_lossy(&output.stdout);
     parse_json_from_output(&stdout).map_err(|e| {
         format!(
@@ -5095,6 +5656,13 @@ async fn ml_ghost_risk_handler() -> impl IntoResponse {
 async fn ml_next_focus_handler(
     axum::extract::Path(node_id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
+    if Uuid::parse_str(&node_id).is_err() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error":"invalid UUID"})),
+        )
+            .into_response();
+    }
     match run_ml_cli(&["next-focus", &node_id]) {
         Ok(v) => (axum::http::StatusCode::OK, axum::Json(v)).into_response(),
         Err(_) => (
@@ -5175,10 +5743,12 @@ pub async fn start_api_server(
     };
     let shared: SharedWorkspace = Arc::new(RwLock::new(workspace));
     let vault_state: SharedVaultState = Arc::new(RwLock::new(registry));
+    let active_focus: SharedActiveFocusState = Arc::new(RwLock::new(load_active_focus_session()));
 
     let app_state = AppState {
         workspace: shared.clone(),
         vaults: vault_state.clone(),
+        active_focus: active_focus.clone(),
     };
 
     // autosave — always saves to the current vault's path
@@ -5207,14 +5777,40 @@ pub async fn start_api_server(
         });
     }
 
+    // active-focus timeout finalizer — independent from browser polling
+    {
+        let focus_app = app_state.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                ticker.tick().await;
+                let should_timeout = {
+                    let active = focus_app.active_focus.read().await;
+                    active.as_ref().is_some_and(|session| {
+                        session.timeout_seconds.is_some_and(|timeout| {
+                            (Utc::now() - session.started_at).num_seconds().max(0) >= timeout as i64
+                        })
+                    })
+                };
+                if should_timeout {
+                    if let Err(err) = finish_active_focus(&focus_app, true).await {
+                        eprintln!("[focus] timeout finalize failed: {}", err.0);
+                    }
+                }
+            }
+        });
+    }
+
     // schedule notifier — fires every 60s, checks all node schedules and sends notifications
     {
-        let sched_ws = shared.clone();
+        let sched_app = app_state.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
             let mut fired: std::collections::HashSet<String> = std::collections::HashSet::new();
-            let mut interval_last: std::collections::HashMap<String, chrono::DateTime<chrono::Local>> =
-                std::collections::HashMap::new();
+            let mut interval_last: std::collections::HashMap<
+                String,
+                chrono::DateTime<chrono::Local>,
+            > = std::collections::HashMap::new();
             loop {
                 ticker.tick().await;
                 use chrono::Datelike;
@@ -5225,8 +5821,8 @@ pub async fn start_api_server(
 
                 let settings = load_notification_settings();
                 let channel = settings.default_channel.as_str();
-                let send_telegram = settings.telegram_enabled
-                    && (channel == "telegram" || channel == "both");
+                let send_telegram =
+                    settings.telegram_enabled && (channel == "telegram" || channel == "both");
 
                 fired.retain(|k| k.ends_with(&current_hhmm));
 
@@ -5242,48 +5838,86 @@ pub async fn start_api_server(
                 }
 
                 let nodes: Vec<SchedInfo> = {
-                    let ws = sched_ws.read().await;
-                    ws.graph.nodes().filter_map(|n| {
-                        let sched = n.metadata.get("schedule")?.as_object()?;
-                        let mode = sched.get("mode")?.as_str()?.to_string();
-                        if mode == "none" { return None; }
-                        let status = sched.get("status").and_then(|v| v.as_str()).unwrap_or("active");
-                        if status != "active" { return None; }
-                        Some(SchedInfo {
-                            id: n.id.to_string(),
-                            content: n.content.clone(),
-                            mode,
-                            time_of_day: sched.get("time_of_day").and_then(|v| v.as_str()).map(str::to_string),
-                            days: sched.get("days_of_week")
-                                .and_then(|v| v.as_array())
-                                .map(|arr| arr.iter().filter_map(|x| x.as_u64().map(|d| d as u8)).collect())
-                                .unwrap_or_default(),
-                            interval_minutes: sched.get("interval_minutes").and_then(|v| v.as_u64()).map(|v| v as u32),
-                            start_at: sched.get("start_at").and_then(|v| v.as_str()).map(str::to_string),
-                            end_at: sched.get("end_at").and_then(|v| v.as_str()).map(str::to_string),
+                    let ws = sched_app.workspace.read().await;
+                    ws.graph
+                        .nodes()
+                        .filter_map(|n| {
+                            let sched = n.metadata.get("schedule")?.as_object()?;
+                            let mode = sched.get("mode")?.as_str()?.to_string();
+                            if mode == "none" {
+                                return None;
+                            }
+                            let status = sched
+                                .get("status")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("active");
+                            if status != "active" {
+                                return None;
+                            }
+                            Some(SchedInfo {
+                                id: n.id.to_string(),
+                                content: n.content.clone(),
+                                mode,
+                                time_of_day: sched
+                                    .get("time_of_day")
+                                    .and_then(|v| v.as_str())
+                                    .map(str::to_string),
+                                days: sched
+                                    .get("days_of_week")
+                                    .and_then(|v| v.as_array())
+                                    .map(|arr| {
+                                        arr.iter()
+                                            .filter_map(|x| x.as_u64().map(|d| d as u8))
+                                            .collect()
+                                    })
+                                    .unwrap_or_default(),
+                                interval_minutes: sched
+                                    .get("interval_minutes")
+                                    .and_then(|v| v.as_u64())
+                                    .map(|v| v as u32),
+                                start_at: sched
+                                    .get("start_at")
+                                    .and_then(|v| v.as_str())
+                                    .map(str::to_string),
+                                end_at: sched
+                                    .get("end_at")
+                                    .and_then(|v| v.as_str())
+                                    .map(str::to_string),
+                            })
                         })
-                    }).collect()
+                        .collect()
                 };
 
                 for info in nodes {
                     let fire_key = format!("{}_{}", info.id, current_hhmm);
-                    if fired.contains(&fire_key) { continue; }
+                    if fired.contains(&fire_key) {
+                        continue;
+                    }
 
                     if let Some(ref end) = info.end_at {
-                        if !end.is_empty() && current_date.as_str() > end.as_str() { continue; }
+                        if !end.is_empty() && current_date.as_str() > date_prefix(end) {
+                            continue;
+                        }
                     }
                     if let Some(ref start) = info.start_at {
-                        if !start.is_empty() && current_date.as_str() < start.as_str() { continue; }
+                        if !start.is_empty() && current_date.as_str() < date_prefix(start) {
+                            continue;
+                        }
                     }
 
-                    let time_matches = info.time_of_day.as_deref().map(str::trim) == Some(current_hhmm.as_str());
+                    let time_matches =
+                        info.time_of_day.as_deref().map(str::trim) == Some(current_hhmm.as_str());
 
                     let should_fire = match info.mode.as_str() {
                         "daily" | "once" => time_matches,
-                        "weekly" | "custom_days" => time_matches && info.days.contains(&current_weekday),
+                        "weekly" | "custom_days" => {
+                            time_matches && info.days.contains(&current_weekday)
+                        }
                         "interval" => {
                             if let Some(interval) = info.interval_minutes.filter(|&v| v > 0) {
-                                let last = interval_last.get(&info.id).copied()
+                                let last = interval_last
+                                    .get(&info.id)
+                                    .copied()
                                     .unwrap_or(now - chrono::Duration::days(1));
                                 (now - last).num_minutes() >= interval as i64
                             } else {
@@ -5293,25 +5927,67 @@ pub async fn start_api_server(
                         _ => false,
                     };
 
-                    if !should_fire { continue; }
+                    if !should_fire {
+                        continue;
+                    }
 
-                    let label = info.content.lines().next().unwrap_or("Node reminder").to_string();
+                    let label = info
+                        .content
+                        .lines()
+                        .next()
+                        .unwrap_or("Node reminder")
+                        .to_string();
                     let msg = format!("SilentNode ⏰ {label}");
 
+                    let mut delivered = false;
                     if send_telegram {
                         match send_telegram_notification(&settings, &msg).await {
                             Ok(()) => {
                                 println!("[scheduler] notified {} at {}", info.id, current_hhmm);
-                                fired.insert(fire_key);
-                                if info.mode == "interval" {
-                                    interval_last.insert(info.id, now);
-                                }
+                                delivered = true;
                             }
-                            Err(e) => eprintln!("[scheduler] telegram failed for {}: {}", info.id, e.0),
+                            Err(e) => {
+                                eprintln!("[scheduler] telegram failed for {}: {}", info.id, e.0)
+                            }
                         }
                     } else {
-                        println!("[scheduler] app-channel due: {} at {}", info.id, current_hhmm);
+                        println!(
+                            "[scheduler] app-channel due: {} at {}",
+                            info.id, current_hhmm
+                        );
+                        delivered = true;
+                    }
+
+                    if delivered {
                         fired.insert(fire_key);
+                        if info.mode == "interval" {
+                            interval_last.insert(info.id.clone(), now);
+                        }
+                        if info.mode == "once" {
+                            if let Ok(node_id) = Uuid::parse_str(&info.id) {
+                                let snapshot = {
+                                    let mut ws = sched_app.workspace.write().await;
+                                    if let Some(node) = ws.graph.get_node_mut(node_id) {
+                                        if let Some(schedule) = node
+                                            .metadata
+                                            .get_mut("schedule")
+                                            .and_then(|value| value.as_object_mut())
+                                        {
+                                            schedule.insert(
+                                                "status".into(),
+                                                serde_json::Value::String("completed".into()),
+                                            );
+                                        }
+                                    }
+                                    ws.snapshot()
+                                };
+                                if let Err(err) =
+                                    save_current_snapshot(&sched_app, snapshot, "schedule").await
+                                {
+                                    eprintln!("[scheduler] once-complete save failed: {}", err.0);
+                                }
+                            }
+                        }
                     }
                 }
             }

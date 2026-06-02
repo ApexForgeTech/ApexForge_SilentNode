@@ -6,6 +6,7 @@ import { api } from './api'
 import type {
   SNode, SEdge, Status, JournalEntry, SeasonReport, OracleSignal, Civilization,
   SoulData, TrailEvent, TectonicData, CivilizationEvent,
+  ActiveFocus,
 } from './types'
 import './styles/global.css'
 
@@ -169,12 +170,13 @@ export default function App() {
   const [apiOk, setApiOk] = useState<boolean | null>(null)
   const [currentVault, setCurrentVault] = useState<string>('Default')
   const [auraClass, setAuraClass] = useState<string>('')
+  const [activeFocus, setActiveFocus] = useState<ActiveFocus | null>(null)
 
   const refresh = useCallback(async () => {
     const results = await Promise.allSettled([
       api.nodes(), api.edges(), api.status(), api.journal(), api.season(), api.oracle(),
       api.civilizations(), api.souls(), api.trail(72), api.tectonics(), api.civilizationEvents(),
-      api.vaults(), api.weather(),
+      api.vaults(), api.weather(), api.activeFocus(),
     ])
     setApiOk(results[0].status === 'fulfilled')
     if (results[11].status === 'fulfilled') setCurrentVault((results[11].value as any).current)
@@ -198,6 +200,7 @@ export default function App() {
         : 'aura-calm'
       setAuraClass(cls)
     }
+    if (results[13].status === 'fulfilled') setActiveFocus(results[13].value as ActiveFocus)
   }, [])
 
   useEffect(() => {
@@ -205,6 +208,13 @@ export default function App() {
     const id = setInterval(refresh, 9000)
     return () => clearInterval(id)
   }, [refresh])
+
+  useEffect(() => {
+    const load = () => api.activeFocus().then(setActiveFocus).catch(() => {})
+    load()
+    const id = setInterval(load, 1000)
+    return () => clearInterval(id)
+  }, [])
 
   useEffect(() => {
     if (!selectedNode) return
@@ -268,7 +278,10 @@ export default function App() {
           <span className="sn-mark" />
           <div>
             <strong>SilentNode</strong>
-            <small>{currentVault} · {season?.season ?? 'No season'} · {apiOk === false ? 'offline' : 'local'}</small>
+            <small>
+              {currentVault} · {season?.season ?? 'No season'} · {apiOk === false ? 'offline' : 'local'}
+              {activeFocus?.active && ` · focus: ${activeFocus.node_nickname || activeFocus.node_preview || 'active'}`}
+            </small>
           </div>
         </div>
         <nav className="sn-nav">

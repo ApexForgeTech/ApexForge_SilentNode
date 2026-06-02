@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import type { SNode } from '../types'
+import type { ActiveFocus, SNode } from '../types'
 import { api } from '../api'
 import { toast } from './Toast'
 
@@ -15,9 +15,19 @@ const NODE_ICONS: Record<string, string> = {
 }
 
 const ALL_TYPES = ['idea','memory','project','person','artifact','media','process','world','other']
+const FOCUS_DEPTHS = ['Glance', 'Read', 'Edit', 'DeepWork'] as const
 
 function eColor(e: number) {
   return e > 0.65 ? 'var(--red)' : e > 0.35 ? 'var(--amber)' : 'var(--green)'
+}
+
+function durationLabel(seconds: number) {
+  const total = Math.max(0, Math.floor(seconds))
+  const h = Math.floor(total / 3600)
+  const m = Math.floor((total % 3600) / 60)
+  const s = total % 60
+  if (h > 0) return `${h}h ${String(m).padStart(2, '0')}m`
+  return `${m}:${String(s).padStart(2, '0')}`
 }
 
 interface Props { node: SNode; nodes?: SNode[]; onClose: () => void; onRefresh: () => void }
@@ -55,6 +65,9 @@ export default function NodeDetail({ node, nodes = [], onClose, onRefresh }: Pro
     risk_level: string; days_to_ghost: number; risk_score: number
   } | null>(null)
   const [nextFocus, setNextFocus] = useState<{ content: string; probability: number }[]>([])
+  const [activeFocus, setActiveFocus] = useState<ActiveFocus | null>(null)
+  const [focusDepth, setFocusDepth] = useState('DeepWork')
+  const [focusTimeout, setFocusTimeout] = useState('40')
 
   function resetEditState() {
     setEditContent(node.content)
@@ -89,6 +102,20 @@ export default function NodeDetail({ node, nodes = [], onClose, onRefresh }: Pro
     fetch(`/api/nodes/${node.id}/attachments`)
       .then(r => r.json()).then(setAttachments).catch(() => {})
   }, [node.id])
+
+  async function loadActiveFocus() {
+    try {
+      setActiveFocus(await api.activeFocus())
+    } catch {
+      setActiveFocus(null)
+    }
+  }
+
+  useEffect(() => {
+    loadActiveFocus()
+    const id = window.setInterval(loadActiveFocus, 1000)
+    return () => window.clearInterval(id)
+  }, [])
   const col  = node.node_type === 'other' && node.aura_color?.startsWith('#')
     ? node.aura_color
     : (NODE_COLORS[node.node_type] ?? 'var(--lavender-text)')
@@ -128,6 +155,35 @@ export default function NodeDetail({ node, nodes = [], onClose, onRefresh }: Pro
       onRefresh()
     } catch (e) { toast(String(e), 'error') }
     setBusy(false)
+  }
+
+  async function startFocusSession() {
+    setBusy(true)
+    try {
+      const mins = Math.max(0, Number(focusTimeout) || 0)
+      const next = await api.startFocus(node.id, focusDepth, mins > 0 ? mins * 60 : undefined)
+      setActiveFocus(next)
+      toast('Focus started')
+      onRefresh()
+    } catch (e: any) {
+      toast(e.message || 'Focus start failed')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function stopFocusSession() {
+    setBusy(true)
+    try {
+      const next = await api.stopFocus()
+      setActiveFocus(next)
+      toast('Focus saved')
+      onRefresh()
+    } catch (e: any) {
+      toast(e.message || 'Focus stop failed')
+    } finally {
+      setBusy(false)
+    }
   }
 
   async function quickLink(targetId: string) {
@@ -392,41 +448,58 @@ export default function NodeDetail({ node, nodes = [], onClose, onRefresh }: Pro
         {/* Focus */}
         <div>
           <div style={{ fontSize: 10, color: 'var(--t4)', fontWeight: 600, letterSpacing: '0.06em', marginBottom: 7, textTransform: 'uppercase' }}>
-            Record Focus
+            Focus Session
           </div>
-          <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap' }}>
-            <button className="btn-sm" disabled={busy} onClick={() => act('Glance recorded', () => api.recordFocus(node.id, 10, 'Glance'))}>
-              Glance
-            </button>
-            <button className="btn-sm" disabled={busy} onClick={() => act('Read recorded', () => api.recordFocus(node.id, 30, 'Read'))}>
-              Read
-            </button>
-            <button className="btn-sm btn-primary" disabled={busy} onClick={() => act('DeepWork recorded', () => api.recordFocus(node.id, 120, 'DeepWork'))}>
-              DeepWork
-            </button>
-          </div>
-          <div style={{ display: 'flex', gap: 5, marginTop: 6, alignItems: 'center' }}>
-            <input
-              id={`custom-focus-${node.id}`}
-              type="number"
-              min={1}
-              max={600}
-              defaultValue={40}
-              style={{ width: 60, padding: '3px 6px', fontSize: 11, borderRadius: 4, border: '1px solid var(--border)', background: 'var(--bg2)', color: 'var(--t1)' }}
-              placeholder="min"
-            />
-            <span style={{ fontSize: 10, color: 'var(--t4)' }}>min</span>
-            <button
-              className="btn-sm"
-              disabled={busy}
-              onClick={() => {
-                const el = document.getElementById(`custom-focus-${node.id}`) as HTMLInputElement
-                const mins = Math.max(1, parseInt(el?.value || '0') || 0)
-                act(`${mins} min recorded`, () => api.recordFocus(node.id, mins * 60, 'DeepWork'))
-              }}
+          {activeFocus?.active && (
+            <div style={{ border: '1px solid var(--line)', borderRadius: 8, padding: 9, marginBottom: 8, background: 'rgba(45,212,191,0.08)' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'center' }}>
+                <strong style={{ color: 'var(--t1)', fontSize: 12 }}>
+                  {activeFocus.node_nickname || activeFocus.node_preview || 'Active focus'}
+                </strong>
+                <span style={{ color: 'var(--green)', fontFamily: 'var(--font-mono)', fontSize: 12 }}>
+                  {durationLabel(activeFocus.elapsed_seconds)}
+                </span>
+              </div>
+              <div style={{ color: 'var(--t4)', fontSize: 10, marginTop: 4 }}>
+                {activeFocus.depth}
+                {typeof activeFocus.remaining_seconds === 'number' && activeFocus.remaining_seconds > 0
+                  ? ` · ${durationLabel(activeFocus.remaining_seconds)} left`
+                  : ''}
+              </div>
+            </div>
+          )}
+
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 74px', gap: 6, alignItems: 'center' }}>
+            <select
+              className="vault-input"
+              value={focusDepth}
+              onChange={e => setFocusDepth(e.target.value)}
+              style={{ height: 30, padding: '3px 7px', fontSize: 11 }}
             >
-              + Log
+              {FOCUS_DEPTHS.map(depth => <option key={depth} value={depth}>{depth}</option>)}
+            </select>
+            <input
+              type="number"
+              min={0}
+              max={600}
+              value={focusTimeout}
+              onChange={e => setFocusTimeout(e.target.value)}
+              className="vault-input"
+              style={{ height: 30, padding: '3px 7px', fontSize: 11 }}
+              title="Timeout in minutes. 0 means no timeout."
+            />
+          </div>
+          <div style={{ display: 'flex', gap: 5, marginTop: 6, alignItems: 'center', flexWrap: 'wrap' }}>
+            <button className="btn-sm btn-primary" disabled={busy} onClick={startFocusSession}>
+              {activeFocus?.active && activeFocus.node_id === node.id ? 'Restart Focus' : 'Start Focus'}
             </button>
+            <button className="btn-sm" disabled={busy || !activeFocus?.active} onClick={stopFocusSession}>
+              Stop & Save
+            </button>
+            <button className="btn-sm" disabled={busy} onClick={() => act('Quick log saved', () => api.recordFocus(node.id, 120, 'DeepWork'))}>
+              +2m Log
+            </button>
+            <span style={{ fontSize: 10, color: 'var(--t4)' }}>min</span>
           </div>
         </div>
 

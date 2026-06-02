@@ -27,7 +27,10 @@ def _all_vault_paths() -> List[str]:
     vf = Path(VAULTS_JSON)
     if not vf.exists():
         return [DB_PATH]
-    data = json.loads(vf.read_text())
+    try:
+        data = json.loads(vf.read_text())
+    except Exception:
+        return [DB_PATH]
     seen, paths = set(), []
     for v in data.get("vaults", []):
         p = v.get("path", "")

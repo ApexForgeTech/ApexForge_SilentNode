@@ -15,7 +15,7 @@ import type {
   CivilizationEvent, TectonicData,
   SystemModeData, AtmosphereData, ForgeArtifactData, TerminalContextData,
   ConstellationData, VisionCoverageData, ObsidianPreviewData, ObsidianImportResult,
-  NotificationSettings, NotificationSettingsUpdate,
+  NotificationSettings, NotificationSettingsUpdate, ActiveFocus,
 } from './types'
 
 const BASE = '/api'
@@ -78,6 +78,15 @@ export const api = {
 
   recordFocus: (node_id: string, seconds: number, depth = 'DeepWork'): Promise<void> =>
     request('/focus', { method: 'POST', body: JSON.stringify({ node_id, seconds, depth }) }),
+
+  activeFocus: (): Promise<ActiveFocus> =>
+    request('/focus/active'),
+
+  startFocus: (node_id: string, depth = 'DeepWork', timeout_seconds?: number): Promise<ActiveFocus> =>
+    request('/focus/active', { method: 'POST', body: JSON.stringify({ node_id, depth, timeout_seconds }) }),
+
+  stopFocus: (): Promise<ActiveFocus> =>
+    request('/focus/active/stop', { method: 'POST' }),
 
   // ── Journal ────────────────────────────────────────────────────────────
   journal: (): Promise<JournalEntry[]> =>
