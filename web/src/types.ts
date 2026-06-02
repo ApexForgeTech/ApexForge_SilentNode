@@ -47,6 +47,22 @@ export interface NotificationSettings {
   telegram_token_preview?: string | null
   telegram_chat_id?: string | null
   default_channel: 'app' | 'telegram' | 'both' | string
+  events: NotificationEventSettings
+}
+
+export interface NotificationEventSettings {
+  node_created: boolean
+  node_updated: boolean
+  node_deleted: boolean
+  focus_started: boolean
+  focus_stopped: boolean
+  focus_logged: boolean
+  mode_changed: boolean
+  task_created: boolean
+  task_completed: boolean
+  calendar_changed: boolean
+  dream_action: boolean
+  schedule_reminder: boolean
 }
 
 export interface NotificationSettingsUpdate {
@@ -54,6 +70,7 @@ export interface NotificationSettingsUpdate {
   telegram_bot_token?: string
   telegram_chat_id?: string
   default_channel?: 'app' | 'telegram' | 'both'
+  events?: NotificationEventSettings
 }
 
 export interface ActiveFocus {

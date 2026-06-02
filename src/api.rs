@@ -962,6 +962,55 @@ pub struct NotificationSettings {
     pub telegram_bot_token: Option<String>,
     pub telegram_chat_id: Option<String>,
     pub default_channel: String,
+    #[serde(default)]
+    pub events: NotificationEventSettings,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationEventSettings {
+    #[serde(default)]
+    pub node_created: bool,
+    #[serde(default)]
+    pub node_updated: bool,
+    #[serde(default)]
+    pub node_deleted: bool,
+    #[serde(default)]
+    pub focus_started: bool,
+    #[serde(default)]
+    pub focus_stopped: bool,
+    #[serde(default)]
+    pub focus_logged: bool,
+    #[serde(default)]
+    pub mode_changed: bool,
+    #[serde(default)]
+    pub task_created: bool,
+    #[serde(default)]
+    pub task_completed: bool,
+    #[serde(default)]
+    pub calendar_changed: bool,
+    #[serde(default)]
+    pub dream_action: bool,
+    #[serde(default = "default_true")]
+    pub schedule_reminder: bool,
+}
+
+impl Default for NotificationEventSettings {
+    fn default() -> Self {
+        Self {
+            node_created: false,
+            node_updated: false,
+            node_deleted: false,
+            focus_started: false,
+            focus_stopped: false,
+            focus_logged: false,
+            mode_changed: false,
+            task_created: false,
+            task_completed: false,
+            calendar_changed: false,
+            dream_action: false,
+            schedule_reminder: true,
+        }
+    }
 }
 
 impl Default for NotificationSettings {
@@ -971,6 +1020,7 @@ impl Default for NotificationSettings {
             telegram_bot_token: None,
             telegram_chat_id: None,
             default_channel: "app".into(),
+            events: NotificationEventSettings::default(),
         }
     }
 }
@@ -982,6 +1032,7 @@ pub struct NotificationSettingsResponse {
     pub telegram_token_preview: Option<String>,
     pub telegram_chat_id: Option<String>,
     pub default_channel: String,
+    pub events: NotificationEventSettings,
 }
 
 #[derive(Deserialize)]
@@ -990,6 +1041,7 @@ pub struct NotificationSettingsRequest {
     pub telegram_bot_token: Option<String>,
     pub telegram_chat_id: Option<String>,
     pub default_channel: Option<String>,
+    pub events: Option<NotificationEventSettings>,
 }
 
 #[derive(Deserialize)]
@@ -1026,6 +1078,10 @@ type ApiResult<T> = Result<T, ApiError>;
 
 const NOTIFICATION_SETTINGS_PATH: &str = "data/settings.local.json";
 const ACTIVE_FOCUS_PATH: &str = "data/active_focus.local.json";
+
+fn default_true() -> bool {
+    true
+}
 
 fn load_notification_settings() -> NotificationSettings {
     std::fs::read_to_string(NOTIFICATION_SETTINGS_PATH)
@@ -1067,6 +1123,7 @@ fn notification_settings_response(settings: NotificationSettings) -> Notificatio
         telegram_token_preview: settings.telegram_bot_token.as_deref().and_then(mask_secret),
         telegram_chat_id: settings.telegram_chat_id,
         default_channel: settings.default_channel,
+        events: settings.events,
     }
 }
 
@@ -1594,17 +1651,27 @@ async fn finish_active_focus(
     } else {
         elapsed
     };
-    let (event, snapshot) = {
+    let (event, snapshot, title) = {
         let mut ws = app.workspace.write().await;
-        if ws.graph.get_node(session.node_id).is_none() {
+        let Some(node) = ws.graph.get_node(session.node_id) else {
             clear_active_focus_session_file();
             return Ok(None);
-        }
+        };
+        let title = preview_text(&node.content, 80);
         let event = ws.record_focus(session.node_id, duration, session.depth)?;
-        (event, ws.snapshot())
+        (event, ws.snapshot(), title)
     };
     save_current_snapshot(app, snapshot, "active focus").await?;
     clear_active_focus_session_file();
+    maybe_send_event_notification(
+        "focus_stopped",
+        format!(
+            "SilentNode: focus stopped\n{title}\n{:.0}s {}",
+            event.duration_seconds,
+            focus_depth_response(event.depth)
+        ),
+    )
+    .await;
     Ok(Some(event))
 }
 
@@ -1679,6 +1746,9 @@ async fn put_notification_settings(
     }
     if req.default_channel.is_some() {
         settings.default_channel = normalize_notification_channel(req.default_channel);
+    }
+    if let Some(events) = req.events {
+        settings.events = events;
     }
 
     save_notification_settings(&settings)?;
@@ -1762,6 +1832,50 @@ async fn send_telegram_notification(
     Ok(())
 }
 
+fn notification_event_enabled(settings: &NotificationSettings, event: &str) -> bool {
+    match event {
+        "node_created" => settings.events.node_created,
+        "node_updated" => settings.events.node_updated,
+        "node_deleted" => settings.events.node_deleted,
+        "focus_started" => settings.events.focus_started,
+        "focus_stopped" => settings.events.focus_stopped,
+        "focus_logged" => settings.events.focus_logged,
+        "mode_changed" => settings.events.mode_changed,
+        "task_created" => settings.events.task_created,
+        "task_completed" => settings.events.task_completed,
+        "calendar_changed" => settings.events.calendar_changed,
+        "dream_action" => settings.events.dream_action,
+        "schedule_reminder" => settings.events.schedule_reminder,
+        _ => false,
+    }
+}
+
+async fn maybe_send_event_notification(event: &str, message: impl Into<String>) {
+    let settings = load_notification_settings();
+    if !settings.telegram_enabled {
+        return;
+    }
+    if !matches!(settings.default_channel.as_str(), "telegram" | "both") {
+        return;
+    }
+    if !notification_event_enabled(&settings, event) {
+        return;
+    }
+    let message = message.into();
+    if let Err(err) = send_telegram_notification(&settings, &message).await {
+        eprintln!("[notification] {event} failed: {}", err.0);
+    }
+}
+
+fn preview_text(value: &str, max: usize) -> String {
+    let mut out = value.lines().next().unwrap_or(value).trim().to_string();
+    if out.chars().count() > max {
+        out = out.chars().take(max).collect::<String>();
+        out.push('…');
+    }
+    out
+}
+
 async fn get_nodes(State(ws): State<SharedWorkspace>) -> impl IntoResponse {
     let ws = ws.read().await;
     let nodes: Vec<NodeResponse> = ws.graph.nodes().map(node_to_response).collect();
@@ -1798,7 +1912,15 @@ async fn post_node(
         .graph
         .get_node(id)
         .ok_or_else(|| ApiError("node not found".into(), StatusCode::NOT_FOUND))?;
-    Ok((StatusCode::CREATED, Json(node_to_response(created))))
+    let response = node_to_response(created);
+    let title = preview_text(&created.content, 80);
+    drop(ws);
+    maybe_send_event_notification(
+        "node_created",
+        format!("SilentNode: node created\n{title}\nType: {}", response.node_type),
+    )
+    .await;
+    Ok((StatusCode::CREATED, Json(response)))
 }
 
 async fn get_node(
@@ -2059,12 +2181,14 @@ async fn delete_node(
             clear_active_focus_session_file();
         }
     }
-    let snapshot = {
+    let (snapshot, title) = {
         let mut ws = app.workspace.write().await;
-        ws.graph.remove_node(node_id)?;
-        ws.snapshot()
+        let removed = ws.graph.remove_node(node_id)?;
+        (ws.snapshot(), preview_text(&removed.content, 80))
     };
     save_current_snapshot(&app, snapshot, "node delete").await?;
+    maybe_send_event_notification("node_deleted", format!("SilentNode: node deleted\n{title}"))
+        .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2075,39 +2199,42 @@ async fn put_node(
 ) -> ApiResult<impl IntoResponse> {
     let node_id = Uuid::parse_str(&id)
         .map_err(|_| ApiError("invalid UUID".into(), StatusCode::BAD_REQUEST))?;
-    let snapshot = {
+    let (snapshot, title) = {
         let mut ws = app.workspace.write().await;
-        let node = ws
-            .graph
-            .get_node_mut(node_id)
-            .ok_or_else(|| ApiError("node not found".into(), StatusCode::NOT_FOUND))?;
-        if let Some(content) = req.content {
-            let content = content.trim().to_string();
-            if !content.is_empty() {
-                node.content = content;
+        let title = {
+            let node = ws
+                .graph
+                .get_node_mut(node_id)
+                .ok_or_else(|| ApiError("node not found".into(), StatusCode::NOT_FOUND))?;
+            if let Some(content) = req.content {
+                let content = content.trim().to_string();
+                if !content.is_empty() {
+                    node.content = content;
+                }
             }
-        }
-        if let Some(nt) = req.node_type {
-            node.node_type = parse_node_type(&nt);
-        }
-        if let Some(color) = req.aura_color {
-            let color = color.trim().to_string();
-            if color.starts_with('#') && (color.len() == 4 || color.len() == 7) {
-                node.aura_color = color;
+            if let Some(nt) = req.node_type {
+                node.node_type = parse_node_type(&nt);
             }
-        }
-        if let Some(nick) = req.nickname {
-            let nick = nick.trim().to_string();
-            if nick.is_empty() {
-                set_node_nickname(node, None);
-            } else {
-                node.metadata
-                    .insert("nickname".to_string(), serde_json::Value::String(nick));
+            if let Some(color) = req.aura_color {
+                let color = color.trim().to_string();
+                if color.starts_with('#') && (color.len() == 4 || color.len() == 7) {
+                    node.aura_color = color;
+                }
             }
-        }
-        set_node_custom_fields(node, req.custom_type, req.custom_color);
-        set_node_schedule(node, req.schedule)?;
-        ws.snapshot()
+            if let Some(nick) = req.nickname {
+                let nick = nick.trim().to_string();
+                if nick.is_empty() {
+                    set_node_nickname(node, None);
+                } else {
+                    node.metadata
+                        .insert("nickname".to_string(), serde_json::Value::String(nick));
+                }
+            }
+            set_node_custom_fields(node, req.custom_type, req.custom_color);
+            set_node_schedule(node, req.schedule)?;
+            preview_text(&node.content, 80)
+        };
+        (ws.snapshot(), title)
     };
     save_current_snapshot(&app, snapshot, "node update").await?;
     let ws = app.workspace.read().await;
@@ -2115,7 +2242,14 @@ async fn put_node(
         .graph
         .get_node(node_id)
         .ok_or_else(|| ApiError("node not found".into(), StatusCode::NOT_FOUND))?;
-    Ok(Json(node_to_response(updated)))
+    let response = node_to_response(updated);
+    drop(ws);
+    maybe_send_event_notification(
+        "node_updated",
+        format!("SilentNode: node updated\n{title}\nType: {}", response.node_type),
+    )
+    .await;
+    Ok(Json(response))
 }
 
 async fn delete_focus_session(
@@ -2214,7 +2348,24 @@ async fn post_active_focus_start(
         *active = Some(session.clone());
     }
     let ws = app.workspace.read().await;
-    Ok(Json(active_focus_response(Some(&session), &ws)))
+    let response = active_focus_response(Some(&session), &ws);
+    let title = response
+        .node_preview
+        .clone()
+        .unwrap_or_else(|| node_id.to_string());
+    drop(ws);
+    maybe_send_event_notification(
+        "focus_started",
+        format!(
+            "SilentNode: focus started\n{title}\nDepth: {}{}",
+            focus_depth_response(depth),
+            timeout_seconds
+                .map(|seconds| format!("\nTimeout: {seconds}s"))
+                .unwrap_or_default()
+        ),
+    )
+    .await;
+    Ok(Json(response))
 }
 
 async fn post_active_focus_stop(
@@ -2242,12 +2393,26 @@ async fn post_focus(
         .as_deref()
         .map(parse_focus_depth)
         .unwrap_or(FocusDepth::Glance);
-    let snapshot = {
+    let (snapshot, title) = {
         let mut ws = app.workspace.write().await;
+        let title = ws
+            .graph
+            .get_node(node_id)
+            .map(|n| preview_text(&n.content, 80))
+            .ok_or_else(|| ApiError("node not found".into(), StatusCode::NOT_FOUND))?;
         ws.record_focus(node_id, req.seconds, depth)?;
-        ws.snapshot()
+        (ws.snapshot(), title)
     };
     save_current_snapshot(&app, snapshot, "focus").await?;
+    maybe_send_event_notification(
+        "focus_logged",
+        format!(
+            "SilentNode: focus logged\n{title}\n{:.0}s {}",
+            req.seconds,
+            focus_depth_response(depth)
+        ),
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2738,6 +2903,11 @@ async fn post_dream_apply(
         }
     };
     save_current_snapshot(&app, snapshot, "dream action").await?;
+    maybe_send_event_notification(
+        "dream_action",
+        format!("SilentNode: dream action applied\n{message}\nAction: {action}"),
+    )
+    .await;
     Ok(Json(DreamActionResponse {
         applied: true,
         action,
@@ -3586,6 +3756,14 @@ async fn post_mode(
             )
         })?;
     }
+    maybe_send_event_notification(
+        "mode_changed",
+        format!(
+            "SilentNode: focus mode changed\nMode: {}",
+            requested.as_deref().unwrap_or("auto")
+        ),
+    )
+    .await;
     Ok(Json(serde_json::json!({
         "mode": requested,
         "source": if requested.is_some() { "manual" } else { "inferred" }
@@ -4529,6 +4707,7 @@ async fn post_calendar_event(
             return Err(ApiError("linked node not found".into(), StatusCode::NOT_FOUND));
         }
     }
+    let message_title = title.clone();
     let mut event = CalendarEvent::new(title, category, start, end);
     if let Some(desc) = req.description {
         event.description = desc;
@@ -4543,6 +4722,15 @@ async fn post_calendar_event(
         ws.snapshot()
     };
     save_current_snapshot(&app, snapshot, "calendar").await?;
+    maybe_send_event_notification(
+        "calendar_changed",
+        format!(
+            "SilentNode: calendar event created\n{}\n{}",
+            preview_text(&message_title, 80),
+            start.to_rfc3339()
+        ),
+    )
+    .await;
     Ok((StatusCode::CREATED, Json(serde_json::json!({ "id": id }))))
 }
 
@@ -4552,15 +4740,24 @@ async fn delete_calendar_event(
 ) -> ApiResult<impl IntoResponse> {
     let ev_id = Uuid::parse_str(&id)
         .map_err(|_| ApiError("invalid UUID".into(), StatusCode::BAD_REQUEST))?;
-    let snapshot = {
+    let (snapshot, message_title) = {
         let mut ws = app.workspace.write().await;
-        if ws.calendar.get_event(ev_id).is_none() {
+        let Some(event) = ws.calendar.get_event(ev_id) else {
             return Err(ApiError("calendar event not found".into(), StatusCode::NOT_FOUND));
-        }
+        };
+        let message_title = event.title.clone();
         ws.calendar.remove_event(ev_id);
-        ws.snapshot()
+        (ws.snapshot(), message_title)
     };
     save_current_snapshot(&app, snapshot, "calendar").await?;
+    maybe_send_event_notification(
+        "calendar_changed",
+        format!(
+            "SilentNode: calendar event deleted\n{}",
+            preview_text(&message_title, 80)
+        ),
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -4766,6 +4963,15 @@ async fn post_task(
     };
     let (snapshot, response) = snapshot;
     save_current_snapshot(&app, snapshot, "task").await?;
+    maybe_send_event_notification(
+        "task_created",
+        format!(
+            "SilentNode: task created\n{}\nDate: {}",
+            preview_text(&response.title, 80),
+            response.date.as_deref().unwrap_or("unscheduled")
+        ),
+    )
+    .await;
     Ok((StatusCode::CREATED, Json(response)))
 }
 
@@ -4776,27 +4982,39 @@ async fn post_task_complete(
 ) -> ApiResult<impl IntoResponse> {
     let node_id = Uuid::parse_str(&id)
         .map_err(|_| ApiError("invalid UUID".into(), StatusCode::BAD_REQUEST))?;
-    let snapshot = {
+    let (snapshot, title) = {
         let mut ws = app.workspace.write().await;
-        let node = ws
-            .graph
-            .get_node_mut(node_id)
-            .ok_or_else(|| ApiError("task not found".into(), StatusCode::NOT_FOUND))?;
-        if node.metadata.get("source_kind").and_then(|v| v.as_str()) != Some("task") {
-            return Err(ApiError(
-                "node is not a task".into(),
-                StatusCode::BAD_REQUEST,
-            ));
-        }
-        node.metadata.insert(
-            "task_status".into(),
-            Value::String(if req.done { "done" } else { "todo" }.into()),
-        );
-        node.entropy = if req.done { 0.55 } else { 0.03 };
-        node.gravity = if req.done { 0.8 } else { 1.8 };
-        ws.snapshot()
+        let title = {
+            let node = ws
+                .graph
+                .get_node_mut(node_id)
+                .ok_or_else(|| ApiError("task not found".into(), StatusCode::NOT_FOUND))?;
+            if node.metadata.get("source_kind").and_then(|v| v.as_str()) != Some("task") {
+                return Err(ApiError(
+                    "node is not a task".into(),
+                    StatusCode::BAD_REQUEST,
+                ));
+            }
+            node.metadata.insert(
+                "task_status".into(),
+                Value::String(if req.done { "done" } else { "todo" }.into()),
+            );
+            node.entropy = if req.done { 0.55 } else { 0.03 };
+            node.gravity = if req.done { 0.8 } else { 1.8 };
+            preview_text(&node.content, 80)
+        };
+        (ws.snapshot(), title)
     };
     save_current_snapshot(&app, snapshot, "task").await?;
+    maybe_send_event_notification(
+        "task_completed",
+        format!(
+            "SilentNode: task {}\n{}",
+            if req.done { "completed" } else { "reopened" },
+            title
+        ),
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -6035,8 +6253,9 @@ pub async fn start_api_server(
 
                 let settings = load_notification_settings();
                 let channel = settings.default_channel.as_str();
-                let send_telegram =
-                    settings.telegram_enabled && (channel == "telegram" || channel == "both");
+                let send_telegram = settings.telegram_enabled
+                    && settings.events.schedule_reminder
+                    && (channel == "telegram" || channel == "both");
 
                 fired.retain(|k| k.ends_with(&current_hhmm));
 
