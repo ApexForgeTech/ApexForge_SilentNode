@@ -228,6 +228,25 @@ pub struct JournalRepairResponse {
     pub repaired_entries: usize,
 }
 
+fn journal_entry_response(
+    ws: &SilentNodeWorkspace,
+    entry: &crate::domain::JournalEntry,
+) -> JournalEntryResponse {
+    JournalEntryResponse {
+        id: entry.id.to_string(),
+        content: entry.content.clone(),
+        timestamp: entry.timestamp.to_rfc3339(),
+        season: entry.season.clone(),
+        linked_nodes: entry.linked_nodes.iter().map(|id| id.to_string()).collect(),
+        linked_node_previews: entry
+            .linked_nodes
+            .iter()
+            .filter_map(|id| ws.graph.get_node(*id))
+            .map(|node| preview_text(&node.content, 48))
+            .collect(),
+    }
+}
+
 // ── Request shapes ─────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -299,6 +318,8 @@ pub struct ActiveFocusSession {
     pub node_id: Uuid,
     pub depth: FocusDepth,
     pub started_at: DateTime<Utc>,
+    #[serde(default)]
+    pub last_heartbeat_at: Option<DateTime<Utc>>,
     pub timeout_seconds: Option<u32>,
 }
 
@@ -325,6 +346,12 @@ pub struct ActiveFocusResponse {
 
 #[derive(Deserialize)]
 pub struct JournalRequest {
+    pub text: String,
+    pub season: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct UpdateJournalRequest {
     pub text: String,
     pub season: Option<String>,
 }
@@ -1198,6 +1225,11 @@ fn clear_active_focus_session_file() {
     let _ = std::fs::remove_file(ACTIVE_FOCUS_PATH);
 }
 
+fn heartbeat_active_focus_session(session: &mut ActiveFocusSession) -> ApiResult<()> {
+    session.last_heartbeat_at = Some(Utc::now());
+    save_active_focus_session(session)
+}
+
 // ── Conversion helpers ─────────────────────────────────────────────────────────
 
 fn node_to_response(n: &crate::domain::NodeData) -> NodeResponse {
@@ -1706,6 +1738,47 @@ async fn save_current_snapshot(
         )
     })?;
     Ok(())
+}
+
+fn finalize_restored_active_focus(
+    workspace: &mut SilentNodeWorkspace,
+    current_path: &StdPath,
+    restored: Option<ActiveFocusSession>,
+) -> Option<ActiveFocusSession> {
+    let Some(session) = restored else {
+        return None;
+    };
+
+    let end_at = session.last_heartbeat_at.unwrap_or(session.started_at);
+    let elapsed = (end_at - session.started_at).num_seconds().max(1) as f32;
+    let duration = session
+        .timeout_seconds
+        .map(|timeout| elapsed.min(timeout.max(1) as f32))
+        .unwrap_or(elapsed);
+
+    if workspace.graph.get_node(session.node_id).is_some() {
+        match workspace.record_focus(session.node_id, duration, session.depth) {
+            Ok(_) => {
+                use crate::storage::WorkspaceStore;
+                match crate::storage::SqliteWorkspaceStore::new(current_path.to_path_buf()) {
+                    Ok(mut store) => {
+                        if let Err(err) = store.save_snapshot(&workspace.snapshot()) {
+                            eprintln!("[focus] restored focus save failed: {err}");
+                        }
+                    }
+                    Err(err) => eprintln!("[focus] restored focus store failed: {err}"),
+                }
+                eprintln!(
+                    "[focus] finalized restored active focus {} at {:.0}s",
+                    session.session_id, duration
+                );
+            }
+            Err(err) => eprintln!("[focus] restored focus finalize failed: {err}"),
+        }
+    }
+
+    clear_active_focus_session_file();
+    None
 }
 
 // ── Handlers ───────────────────────────────────────────────────────────────────
@@ -2348,6 +2421,7 @@ async fn post_active_focus_start(
         node_id,
         depth,
         started_at: Utc::now(),
+        last_heartbeat_at: Some(Utc::now()),
         timeout_seconds,
     };
     save_active_focus_session(&session)?;
@@ -2457,21 +2531,45 @@ async fn get_journal(State(ws): State<SharedWorkspace>) -> impl IntoResponse {
         .journal
         .entries()
         .iter()
-        .map(|e| JournalEntryResponse {
-            id: e.id.to_string(),
-            content: e.content.clone(),
-            timestamp: e.timestamp.to_rfc3339(),
-            season: e.season.clone(),
-            linked_nodes: e.linked_nodes.iter().map(|id| id.to_string()).collect(),
-            linked_node_previews: e
-                .linked_nodes
-                .iter()
-                .filter_map(|id| ws.graph.get_node(*id))
-                .map(|node| preview_text(&node.content, 48))
-                .collect(),
-        })
+        .map(|e| journal_entry_response(&ws, e))
         .collect();
     Json(entries)
+}
+
+async fn put_journal(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateJournalRequest>,
+) -> ApiResult<impl IntoResponse> {
+    let entry_id = Uuid::parse_str(&id)
+        .map_err(|_| ApiError("invalid journal id".into(), StatusCode::BAD_REQUEST))?;
+    let text = validated_text(req.text, "text", 20_000)?;
+    let (response, snapshot) = {
+        let mut ws = app.workspace.write().await;
+        let entry = ws
+            .update_journal_entry(entry_id, text, req.season)
+            .ok_or_else(|| ApiError("journal entry not found".into(), StatusCode::NOT_FOUND))?;
+        let response = journal_entry_response(&ws, &entry);
+        (response, ws.snapshot())
+    };
+    save_current_snapshot(&app, snapshot, "journal update").await?;
+    Ok(Json(response))
+}
+
+async fn delete_journal(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<impl IntoResponse> {
+    let entry_id = Uuid::parse_str(&id)
+        .map_err(|_| ApiError("invalid journal id".into(), StatusCode::BAD_REQUEST))?;
+    let snapshot = {
+        let mut ws = app.workspace.write().await;
+        ws.remove_journal_entry(entry_id)
+            .ok_or_else(|| ApiError("journal entry not found".into(), StatusCode::NOT_FOUND))?;
+        ws.snapshot()
+    };
+    save_current_snapshot(&app, snapshot, "journal delete").await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn post_journal_repair_links(State(app): State<AppState>) -> ApiResult<impl IntoResponse> {
@@ -5809,6 +5907,10 @@ pub fn build_router(app: AppState) -> Router {
         )
         .route("/journal", get(get_journal).post(post_journal))
         .route("/journal/repair-links", post(post_journal_repair_links))
+        .route(
+            "/journal/:id",
+            axum::routing::delete(delete_journal).put(put_journal),
+        )
         .route("/tasks", get(get_tasks).post(post_task))
         .route(
             "/tasks/:id/complete",
@@ -6209,7 +6311,7 @@ pub async fn start_api_server(
         .join("vaults.json");
     let registry = VaultRegistry::load_or_create(registry_path, &sqlite_path);
     let current_path = registry.current_path();
-    let workspace = if current_path.exists() {
+    let mut workspace = if current_path.exists() {
         use crate::storage::WorkspaceStore;
         match crate::storage::SqliteWorkspaceStore::new(current_path.clone())
             .and_then(|store| store.load_snapshot())
@@ -6220,9 +6322,14 @@ pub async fn start_api_server(
     } else {
         workspace
     };
+    let restored_focus = finalize_restored_active_focus(
+        &mut workspace,
+        current_path.as_path(),
+        load_active_focus_session(),
+    );
     let shared: SharedWorkspace = Arc::new(RwLock::new(workspace));
     let vault_state: SharedVaultState = Arc::new(RwLock::new(registry));
-    let active_focus: SharedActiveFocusState = Arc::new(RwLock::new(load_active_focus_session()));
+    let active_focus: SharedActiveFocusState = Arc::new(RwLock::new(restored_focus));
 
     let app_state = AppState {
         workspace: shared.clone(),
@@ -6264,12 +6371,21 @@ pub async fn start_api_server(
             loop {
                 ticker.tick().await;
                 let should_timeout = {
-                    let active = focus_app.active_focus.read().await;
-                    active.as_ref().is_some_and(|session| {
-                        session.timeout_seconds.is_some_and(|timeout| {
-                            (Utc::now() - session.started_at).num_seconds().max(0) >= timeout as i64
-                        })
-                    })
+                    let mut active = focus_app.active_focus.write().await;
+                    if let Some(session) = active.as_mut() {
+                        let timed_out = session.timeout_seconds.is_some_and(|timeout| {
+                            (Utc::now() - session.started_at).num_seconds().max(0)
+                                >= timeout as i64
+                        });
+                        if !timed_out {
+                            if let Err(err) = heartbeat_active_focus_session(session) {
+                                eprintln!("[focus] heartbeat save failed: {}", err.0);
+                            }
+                        }
+                        timed_out
+                    } else {
+                        false
+                    }
                 };
                 if should_timeout {
                     if let Err(err) = finish_active_focus(&focus_app, true).await {

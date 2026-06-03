@@ -192,6 +192,22 @@ impl SilentNodeWorkspace {
         repaired
     }
 
+    pub fn update_journal_entry(
+        &mut self,
+        entry_id: Uuid,
+        content: impl Into<String>,
+        season: Option<String>,
+    ) -> Option<JournalEntry> {
+        let content = content.into();
+        let linked_nodes = self.journal_link_candidates(&content);
+        self.journal
+            .update_entry(entry_id, content, linked_nodes, season)
+    }
+
+    pub fn remove_journal_entry(&mut self, entry_id: Uuid) -> Option<JournalEntry> {
+        self.journal.remove_entry(entry_id)
+    }
+
     fn journal_link_candidates(&self, content: &str) -> Vec<Uuid> {
         let mut seen = HashSet::new();
         let mut linked_nodes = self

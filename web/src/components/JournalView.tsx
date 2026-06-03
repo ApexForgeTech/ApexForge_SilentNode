@@ -16,6 +16,9 @@ export default function JournalView({ entries, nodes, season, onRefresh }: Props
   const [saving,   setSaving]   = useState(false)
   const [selected, setSelected] = useState<JournalEntry | null>(null)
   const [search,   setSearch]   = useState('')
+  const [editing,  setEditing]  = useState(false)
+  const [editText, setEditText] = useState('')
+  const [mutating, setMutating] = useState(false)
 
   const filtered = [...entries]
     .reverse()
@@ -32,6 +35,45 @@ export default function JournalView({ entries, nodes, season, onRefresh }: Props
       onRefresh()
     } catch (e) { toast(String(e), 'error') }
     setSaving(false)
+  }
+
+  function startEdit(entry: JournalEntry) {
+    setEditing(true)
+    setEditText(entry.content)
+  }
+
+  function closeDetail() {
+    setSelected(null)
+    setEditing(false)
+    setEditText('')
+  }
+
+  async function saveEdit() {
+    if (!selected || !editText.trim()) return
+    setMutating(true)
+    try {
+      const updated = await api.updateJournal(selected.id, editText.trim(), selected.season)
+      setSelected(updated)
+      setEditing(false)
+      setEditText('')
+      toast('Journal entry updated')
+      onRefresh()
+    } catch (e) { toast(String(e), 'error') }
+    setMutating(false)
+  }
+
+  async function deleteEntry() {
+    if (!selected) return
+    const ok = window.confirm('Delete this journal entry?')
+    if (!ok) return
+    setMutating(true)
+    try {
+      await api.deleteJournal(selected.id)
+      toast('Journal entry deleted')
+      closeDetail()
+      onRefresh()
+    } catch (e) { toast(String(e), 'error') }
+    setMutating(false)
   }
 
   return (
@@ -90,7 +132,11 @@ export default function JournalView({ entries, nodes, season, onRefresh }: Props
               <div
                 key={e.id}
                 className={`list-item ${isActive ? 'active' : ''}`}
-                onClick={() => setSelected(isActive ? null : e)}
+                onClick={() => {
+                  setSelected(isActive ? null : e)
+                  setEditing(false)
+                  setEditText('')
+                }}
               >
                 <div style={{ width: 6, height: 6, borderRadius: '50%', background: sc, marginTop: 4, flexShrink: 0 }} />
                 <div style={{ minWidth: 0 }}>
@@ -122,19 +168,59 @@ export default function JournalView({ entries, nodes, season, onRefresh }: Props
               {selected.season && (
                 <span className="badge badge-cyan" style={{ marginLeft: 6 }}>{selected.season}</span>
               )}
+              {!editing && (
+                <>
+                  <button
+                    className="btn-xs"
+                    style={{ marginLeft: 'auto' }}
+                    onClick={() => startEdit(selected)}
+                  >Edit</button>
+                  <button
+                    className="btn-xs btn-danger"
+                    onClick={deleteEntry}
+                    disabled={mutating}
+                  >Delete</button>
+                </>
+              )}
               <button
                 className="btn-xs"
-                style={{ marginLeft: 'auto' }}
-                onClick={() => setSelected(null)}
+                style={{ marginLeft: editing ? 'auto' : 0 }}
+                onClick={closeDetail}
               >✕</button>
             </div>
             <div className="scroll-y" style={{ flex: 1, padding: '16px 20px' }}>
-              <div style={{
-                color: 'var(--text-primary)', fontSize: 13, lineHeight: 1.9,
-                whiteSpace: 'pre-wrap', wordBreak: 'break-word',
-              }}>
-                {selected.content}
-              </div>
+              {editing ? (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                  <textarea
+                    value={editText}
+                    onChange={e => setEditText(e.target.value)}
+                    onKeyDown={e => { if (e.ctrlKey && e.key === 'Enter') saveEdit() }}
+                    style={{ minHeight: 220, fontSize: 13, lineHeight: 1.7 }}
+                  />
+                  <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+                    <button
+                      className="btn-xs"
+                      onClick={() => {
+                        setEditing(false)
+                        setEditText('')
+                      }}
+                      disabled={mutating}
+                    >Cancel</button>
+                    <button
+                      className="btn-primary"
+                      onClick={saveEdit}
+                      disabled={mutating || !editText.trim()}
+                    >{mutating ? 'Saving…' : 'Save Changes'}</button>
+                  </div>
+                </div>
+              ) : (
+                <div style={{
+                  color: 'var(--text-primary)', fontSize: 13, lineHeight: 1.9,
+                  whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+                }}>
+                  {selected.content}
+                </div>
+              )}
               {selected.linked_nodes.length > 0 && (
                 <div style={{ marginTop: 20, paddingTop: 12, borderTop: '1px solid var(--border)' }}>
                   <div style={{ color: 'var(--text-muted)', fontSize: 10, marginBottom: 6, fontFamily: 'var(--font-head)', letterSpacing: '0.1em' }}>

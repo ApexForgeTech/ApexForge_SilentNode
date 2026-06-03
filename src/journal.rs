@@ -36,6 +36,29 @@ impl JournalEngine {
         &mut self.entries
     }
 
+    pub fn get(&self, id: Uuid) -> Option<&JournalEntry> {
+        self.entries.iter().find(|entry| entry.id == id)
+    }
+
+    pub fn update_entry(
+        &mut self,
+        id: Uuid,
+        content: String,
+        linked_nodes: Vec<Uuid>,
+        season: Option<String>,
+    ) -> Option<JournalEntry> {
+        let entry = self.entries.iter_mut().find(|entry| entry.id == id)?;
+        entry.content = content;
+        entry.linked_nodes = linked_nodes;
+        entry.season = season;
+        Some(entry.clone())
+    }
+
+    pub fn remove_entry(&mut self, id: Uuid) -> Option<JournalEntry> {
+        let index = self.entries.iter().position(|entry| entry.id == id)?;
+        Some(self.entries.remove(index))
+    }
+
     pub fn search(&self, query: &str) -> Vec<JournalEntry> {
         let needle = query.to_lowercase();
         self.entries

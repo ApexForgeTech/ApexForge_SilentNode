@@ -95,6 +95,12 @@ export const api = {
   addJournal: (text: string, season?: string): Promise<JournalEntry> =>
     request('/journal', { method: 'POST', body: JSON.stringify({ text, season }) }),
 
+  updateJournal: (id: string, text: string, season?: string | null): Promise<JournalEntry> =>
+    request(`/journal/${id}`, { method: 'PUT', body: JSON.stringify({ text, season }) }),
+
+  deleteJournal: (id: string): Promise<void> =>
+    request(`/journal/${id}`, { method: 'DELETE' }),
+
   tasks: (date?: string): Promise<DailyTask[]> =>
     request(`/tasks${date ? `?date=${encodeURIComponent(date)}` : ''}`),
 

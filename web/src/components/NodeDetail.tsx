@@ -68,6 +68,10 @@ export default function NodeDetail({ node, nodes = [], onClose, onRefresh }: Pro
   const [activeFocus, setActiveFocus] = useState<ActiveFocus | null>(null)
   const [focusDepth, setFocusDepth] = useState('DeepWork')
   const [focusTimeout, setFocusTimeout] = useState('40')
+  const [quickLogMinutes, setQuickLogMinutes] = useState(() => {
+    const saved = window.localStorage.getItem('silentnode.quickLogMinutes')
+    return saved && Number(saved) > 0 ? saved : '3'
+  })
 
   function resetEditState() {
     setEditContent(node.content)
@@ -184,6 +188,14 @@ export default function NodeDetail({ node, nodes = [], onClose, onRefresh }: Pro
     } finally {
       setBusy(false)
     }
+  }
+
+  async function quickLogFocus() {
+    const minutes = Math.max(1, Math.min(1440, Number(quickLogMinutes) || 3))
+    const normalized = String(minutes)
+    setQuickLogMinutes(normalized)
+    window.localStorage.setItem('silentnode.quickLogMinutes', normalized)
+    await act('Quick log saved', () => api.recordFocus(node.id, minutes * 60, focusDepth))
   }
 
   async function quickLink(targetId: string) {
@@ -496,8 +508,24 @@ export default function NodeDetail({ node, nodes = [], onClose, onRefresh }: Pro
             <button className="btn-sm" disabled={busy || !activeFocus?.active} onClick={stopFocusSession}>
               Stop & Save
             </button>
-            <button className="btn-sm" disabled={busy} onClick={() => act('Quick log saved', () => api.recordFocus(node.id, 120, 'DeepWork'))}>
-              +2m Log
+            <input
+              type="number"
+              min={1}
+              max={1440}
+              value={quickLogMinutes}
+              onChange={e => setQuickLogMinutes(e.target.value)}
+              onBlur={() => {
+                const minutes = Math.max(1, Math.min(1440, Number(quickLogMinutes) || 3))
+                const normalized = String(minutes)
+                setQuickLogMinutes(normalized)
+                window.localStorage.setItem('silentnode.quickLogMinutes', normalized)
+              }}
+              className="vault-input"
+              style={{ width: 58, height: 28, padding: '3px 7px', fontSize: 11 }}
+              title="Quick log duration in minutes"
+            />
+            <button className="btn-sm" disabled={busy} onClick={quickLogFocus}>
+              +{Math.max(1, Number(quickLogMinutes) || 3)}m Log
             </button>
             <span style={{ fontSize: 10, color: 'var(--t4)' }}>min</span>
           </div>
