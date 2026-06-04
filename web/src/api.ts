@@ -92,11 +92,11 @@ export const api = {
   journal: (): Promise<JournalEntry[]> =>
     request('/journal'),
 
-  addJournal: (text: string, season?: string): Promise<JournalEntry> =>
-    request('/journal', { method: 'POST', body: JSON.stringify({ text, season }) }),
+  addJournal: (text: string, season?: string, linked_nodes?: string[]): Promise<JournalEntry> =>
+    request('/journal', { method: 'POST', body: JSON.stringify({ text, season, linked_nodes }) }),
 
-  updateJournal: (id: string, text: string, season?: string | null): Promise<JournalEntry> =>
-    request(`/journal/${id}`, { method: 'PUT', body: JSON.stringify({ text, season }) }),
+  updateJournal: (id: string, text: string, season?: string | null, linked_nodes?: string[]): Promise<JournalEntry> =>
+    request(`/journal/${id}`, { method: 'PUT', body: JSON.stringify({ text, season, linked_nodes }) }),
 
   deleteJournal: (id: string): Promise<void> =>
     request(`/journal/${id}`, { method: 'DELETE' }),

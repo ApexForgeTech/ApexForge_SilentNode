@@ -163,6 +163,20 @@ impl SilentNodeWorkspace {
         self.journal.add_entry(content, linked_nodes, season)
     }
 
+    pub fn add_journal_entry_with_links(
+        &mut self,
+        content: impl Into<String>,
+        season: Option<String>,
+        explicit_links: impl IntoIterator<Item = Uuid>,
+    ) -> JournalEntry {
+        let content = content.into();
+        let linked_nodes = self.merge_journal_links(
+            self.journal_link_candidates(&content),
+            explicit_links,
+        );
+        self.journal.add_entry(content, linked_nodes, season)
+    }
+
     pub fn repair_journal_links(&mut self) -> usize {
         let repairs = self
             .journal
@@ -204,6 +218,22 @@ impl SilentNodeWorkspace {
             .update_entry(entry_id, content, linked_nodes, season)
     }
 
+    pub fn update_journal_entry_with_links(
+        &mut self,
+        entry_id: Uuid,
+        content: impl Into<String>,
+        season: Option<String>,
+        explicit_links: impl IntoIterator<Item = Uuid>,
+    ) -> Option<JournalEntry> {
+        let content = content.into();
+        let linked_nodes = self.merge_journal_links(
+            self.journal_link_candidates(&content),
+            explicit_links,
+        );
+        self.journal
+            .update_entry(entry_id, content, linked_nodes, season)
+    }
+
     pub fn remove_journal_entry(&mut self, entry_id: Uuid) -> Option<JournalEntry> {
         self.journal.remove_entry(entry_id)
     }
@@ -224,6 +254,19 @@ impl SilentNodeWorkspace {
         }
 
         linked_nodes
+    }
+
+    fn merge_journal_links(
+        &self,
+        base_links: Vec<Uuid>,
+        explicit_links: impl IntoIterator<Item = Uuid>,
+    ) -> Vec<Uuid> {
+        let mut seen = HashSet::new();
+        base_links
+            .into_iter()
+            .chain(explicit_links)
+            .filter(|id| self.graph.get_node(*id).is_some() && seen.insert(*id))
+            .collect()
     }
 
     fn semantic_journal_matches(&self, content: &str, limit: usize) -> Vec<Uuid> {

@@ -82,7 +82,7 @@ impl DreamEngine {
 
     fn propose_edges(&self, workspace: &SilentNodeWorkspace, out: &mut Vec<DreamProposal>) {
         let engine = SuggestionEngine::new();
-        let node_ids: Vec<Uuid> = workspace.graph.node_ids();
+        let node_ids = ranked_node_ids(workspace);
         let mut seen: HashSet<(Uuid, Uuid)> = HashSet::new();
 
         for &id in node_ids.iter().take(30) {
@@ -186,7 +186,7 @@ impl DreamEngine {
 
     fn propose_merges(&self, workspace: &SilentNodeWorkspace, out: &mut Vec<DreamProposal>) {
         let engine = SuggestionEngine::new();
-        let node_ids: Vec<Uuid> = workspace.graph.node_ids();
+        let node_ids = ranked_node_ids(workspace);
         let mut seen: HashSet<(Uuid, Uuid)> = HashSet::new();
 
         for &id in node_ids.iter().take(25) {
@@ -293,14 +293,33 @@ impl Default for DreamEngine {
 }
 
 fn clip(s: &str, max: usize) -> &str {
-    if s.chars().count() <= max {
-        s
+    let line = s.lines().next().unwrap_or(s).trim();
+    if line.chars().count() <= max {
+        line
     } else {
-        let end = s
+        let end = line
             .char_indices()
             .nth(max)
             .map(|(idx, _)| idx)
-            .unwrap_or(s.len());
-        &s[..end]
+            .unwrap_or(line.len());
+        &line[..end]
     }
+}
+
+fn ranked_node_ids(workspace: &SilentNodeWorkspace) -> Vec<Uuid> {
+    let mut nodes = workspace
+        .graph
+        .nodes()
+        .filter(|node| !node.is_ghost && !node.is_void && !node.is_fossil)
+        .map(|node| (node.id, node.gravity, node.access_count, node.accessed_at))
+        .collect::<Vec<_>>();
+
+    nodes.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.2.cmp(&a.2))
+            .then_with(|| b.3.cmp(&a.3))
+    });
+
+    nodes.into_iter().map(|(id, _, _, _)| id).collect()
 }

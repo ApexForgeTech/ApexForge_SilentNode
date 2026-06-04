@@ -379,9 +379,6 @@ export default function NodeDetail({ node, nodes = [], onClose, onRefresh }: Pro
           <div style={{ color: 'var(--lavender-text)', fontSize: 13, fontWeight: 700, marginBottom: 5, wordBreak: 'break-word' }}>
             {node.nickname}
           </div>
-          <div style={{ color: 'var(--t1)', fontSize: 13, lineHeight: 1.5, wordBreak: 'break-word' }}>
-            {node.content}
-          </div>
           {flags.length > 0 && (
             <div style={{ display: 'flex', gap: 4, marginTop: 6, flexWrap: 'wrap' }}>
               {flags.map(f => (
@@ -416,6 +413,13 @@ export default function NodeDetail({ node, nodes = [], onClose, onRefresh }: Pro
       )}
 
       <div className="scroll fill" style={{ padding: '12px 14px', display: 'flex', flexDirection: 'column', gap: 16 }}>
+
+        {/* Content */}
+        {node.content && (
+          <div style={{ color: 'var(--t1)', fontSize: 13, lineHeight: 1.6, wordBreak: 'break-word', whiteSpace: 'pre-wrap' }}>
+            {node.content}
+          </div>
+        )}
 
         {/* Gauges */}
         <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>

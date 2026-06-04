@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import type { JournalEntry, SeasonReport, SNode } from '../types'
 import { SEASON_COLORS } from '../types'
 import { api } from '../api'
@@ -19,11 +19,37 @@ export default function JournalView({ entries, nodes, season, onRefresh }: Props
   const [editing,  setEditing]  = useState(false)
   const [editText, setEditText] = useState('')
   const [mutating, setMutating] = useState(false)
+  const [linkQuery, setLinkQuery] = useState('')
+  const [focusSecondsByNode, setFocusSecondsByNode] = useState<Record<string, number>>({})
 
   const filtered = [...entries]
     .reverse()
     .filter(e => !search || e.content.toLowerCase().includes(search.toLowerCase()))
   const nodeMap = new Map(nodes.map(node => [node.id, node]))
+  const selectedLinked = useMemo(
+    () => new Set(selected?.linked_nodes ?? []),
+    [selected?.id, selected?.linked_nodes.join('|')]
+  )
+  const linkMatches = nodes
+    .filter(node => !selectedLinked.has(node.id))
+    .filter(node => {
+      const q = linkQuery.trim().toLowerCase()
+      if (!q) return false
+      return node.nickname.toLowerCase().includes(q) || node.content.toLowerCase().includes(q)
+    })
+    .slice(0, 8)
+
+  useEffect(() => {
+    api.trail(24 * 30)
+      .then(events => {
+        const totals: Record<string, number> = {}
+        for (const event of events) {
+          totals[event.node_id] = (totals[event.node_id] || 0) + event.duration_seconds
+        }
+        setFocusSecondsByNode(totals)
+      })
+      .catch(() => {})
+  }, [])
 
   async function save() {
     if (!text.trim()) return
@@ -46,13 +72,14 @@ export default function JournalView({ entries, nodes, season, onRefresh }: Props
     setSelected(null)
     setEditing(false)
     setEditText('')
+    setLinkQuery('')
   }
 
   async function saveEdit() {
     if (!selected || !editText.trim()) return
     setMutating(true)
     try {
-      const updated = await api.updateJournal(selected.id, editText.trim(), selected.season)
+      const updated = await api.updateJournal(selected.id, editText.trim(), selected.season, selected.linked_nodes)
       setSelected(updated)
       setEditing(false)
       setEditText('')
@@ -74,6 +101,42 @@ export default function JournalView({ entries, nodes, season, onRefresh }: Props
       onRefresh()
     } catch (e) { toast(String(e), 'error') }
     setMutating(false)
+  }
+
+  async function quickLinkNode(nodeId: string) {
+    if (!selected) return
+    const nextLinks = Array.from(new Set([...selected.linked_nodes, nodeId]))
+    setMutating(true)
+    try {
+      const updated = await api.updateJournal(selected.id, selected.content, selected.season, nextLinks)
+      setSelected(updated)
+      setLinkQuery('')
+      toast('Journal linked to node')
+      onRefresh()
+    } catch (e) { toast(String(e), 'error') }
+    setMutating(false)
+  }
+
+  async function unlinkNode(nodeId: string) {
+    if (!selected) return
+    const nextLinks = selected.linked_nodes.filter(id => id !== nodeId)
+    setMutating(true)
+    try {
+      const updated = await api.updateJournal(selected.id, selected.content, selected.season, nextLinks)
+      setSelected(updated)
+      toast('Journal link removed')
+      onRefresh()
+    } catch (e) { toast(String(e), 'error') }
+    setMutating(false)
+  }
+
+  function focusLabel(seconds: number) {
+    if (!seconds) return 'no focus logged'
+    const mins = Math.round(seconds / 60)
+    if (mins < 60) return `${mins}m focus`
+    const hours = Math.floor(mins / 60)
+    const rest = mins % 60
+    return rest ? `${hours}h ${rest}m focus` : `${hours}h focus`
   }
 
   return (
@@ -235,12 +298,51 @@ export default function JournalView({ entries, nodes, season, onRefresh }: Props
                         selected.linked_node_previews?.[index] ||
                         `${id.slice(0, 8)}…`
                       return (
-                        <span key={id} className="badge badge-cyan" title={id} style={{ fontSize: 9 }}>
-                          {label.slice(0, 34)}
-                        </span>
+                        <button
+                          key={id}
+                          className="badge badge-cyan"
+                          title={`${id} · click to unlink`}
+                          disabled={mutating}
+                          onClick={() => unlinkNode(id)}
+                          style={{ fontSize: 9, cursor: 'pointer' }}
+                        >
+                          {label.slice(0, 34)} ×
+                        </button>
                       )
                     })}
                   </div>
+                </div>
+              )}
+              {selected && (
+                <div style={{ marginTop: 14, paddingTop: 12, borderTop: '1px solid var(--border)' }}>
+                  <div style={{ color: 'var(--text-muted)', fontSize: 10, marginBottom: 6, fontFamily: 'var(--font-head)', letterSpacing: '0.1em' }}>
+                    QUICK LINK NODE
+                  </div>
+                  <input
+                    type="text"
+                    placeholder="Search existing nodes…"
+                    value={linkQuery}
+                    onChange={e => setLinkQuery(e.target.value)}
+                    style={{ padding: '6px 10px', marginBottom: 8 }}
+                  />
+                  {linkMatches.length > 0 && (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+                      {linkMatches.map(node => (
+                        <button
+                          key={node.id}
+                          className="btn-xs"
+                          disabled={mutating}
+                          onClick={() => quickLinkNode(node.id)}
+                          style={{ textAlign: 'left', display: 'flex', justifyContent: 'space-between', gap: 8 }}
+                        >
+                          <span>{(node.nickname || node.content.split('\n')[0]).slice(0, 42)}</span>
+                          <span style={{ color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>
+                            {focusLabel(focusSecondsByNode[node.id] || 0)}
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
                 </div>
               )}
             </div>

@@ -247,6 +247,21 @@ fn journal_entry_response(
     }
 }
 
+fn parse_optional_node_ids(values: Option<Vec<String>>) -> ApiResult<Vec<Uuid>> {
+    values
+        .unwrap_or_default()
+        .into_iter()
+        .map(|value| {
+            Uuid::parse_str(value.trim()).map_err(|_| {
+                ApiError(
+                    format!("invalid linked node UUID: {value}"),
+                    StatusCode::BAD_REQUEST,
+                )
+            })
+        })
+        .collect()
+}
+
 // ── Request shapes ─────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -348,12 +363,14 @@ pub struct ActiveFocusResponse {
 pub struct JournalRequest {
     pub text: String,
     pub season: Option<String>,
+    pub linked_nodes: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
 pub struct UpdateJournalRequest {
     pub text: String,
     pub season: Option<String>,
+    pub linked_nodes: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -2503,9 +2520,19 @@ async fn post_journal(
     Json(req): Json<JournalRequest>,
 ) -> ApiResult<impl IntoResponse> {
     let text = validated_text(req.text, "text", 20_000)?;
+    let mut linked_nodes = parse_optional_node_ids(req.linked_nodes)?;
+    if let Some(active_node_id) = app
+        .active_focus
+        .read()
+        .await
+        .as_ref()
+        .map(|session| session.node_id)
+    {
+        linked_nodes.push(active_node_id);
+    }
     let (entry, linked_node_previews, snapshot) = {
         let mut ws = app.workspace.write().await;
-        let entry = ws.add_journal_entry(text, req.season);
+        let entry = ws.add_journal_entry_with_links(text, req.season, linked_nodes);
         let linked_node_previews = entry
             .linked_nodes
             .iter()
@@ -2544,10 +2571,11 @@ async fn put_journal(
     let entry_id = Uuid::parse_str(&id)
         .map_err(|_| ApiError("invalid journal id".into(), StatusCode::BAD_REQUEST))?;
     let text = validated_text(req.text, "text", 20_000)?;
+    let linked_nodes = parse_optional_node_ids(req.linked_nodes)?;
     let (response, snapshot) = {
         let mut ws = app.workspace.write().await;
         let entry = ws
-            .update_journal_entry(entry_id, text, req.season)
+            .update_journal_entry_with_links(entry_id, text, req.season, linked_nodes)
             .ok_or_else(|| ApiError("journal entry not found".into(), StatusCode::NOT_FOUND))?;
         let response = journal_entry_response(&ws, &entry);
         (response, ws.snapshot())
@@ -3209,6 +3237,23 @@ async fn post_connect(
         ws.snapshot()
     };
     save_current_snapshot(&app, snapshot, "connect").await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn post_disconnect(
+    State(app): State<AppState>,
+    Json(req): Json<ConnectRequest>,
+) -> ApiResult<impl IntoResponse> {
+    let src = Uuid::parse_str(&req.source_id)
+        .map_err(|_| ApiError("invalid source UUID".into(), StatusCode::BAD_REQUEST))?;
+    let dst = Uuid::parse_str(&req.target_id)
+        .map_err(|_| ApiError("invalid target UUID".into(), StatusCode::BAD_REQUEST))?;
+    let snapshot = {
+        let mut ws = app.workspace.write().await;
+        ws.disconnect_nodes(src, dst)?;
+        ws.snapshot()
+    };
+    save_current_snapshot(&app, snapshot, "disconnect").await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -5893,6 +5938,7 @@ pub fn build_router(app: AppState) -> Router {
         .route("/nodes/:id/revive", axum::routing::post(post_revive))
         .route("/edges", get(get_edges))
         .route("/connect", axum::routing::post(post_connect))
+        .route("/disconnect", axum::routing::post(post_disconnect))
         // cognitive interaction
         .route("/thought", post(post_thought))
         .route("/focus", post(post_focus))

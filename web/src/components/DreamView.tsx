@@ -21,6 +21,13 @@ interface Props { nodes: SNode[] }
 export default function DreamView({ nodes }: Props) {
   const [proposals, setProposals] = useState<DreamProposal[]>([])
   const [selected,  setSelected]  = useState<DreamProposal | null>(null)
+  const [ignored, setIgnored] = useState<Set<string>>(() => {
+    try {
+      return new Set(JSON.parse(window.localStorage.getItem('silentnode.ignoredDreams') || '[]'))
+    } catch {
+      return new Set()
+    }
+  })
   const [synthesis, setSynthesis]  = useState('')
   const [synResult, setSynResult]  = useState<{ narrative: string; related_nodes: string[] } | null>(null)
   const [synLoading, setSynLoading] = useState(false)
@@ -41,8 +48,9 @@ export default function DreamView({ nodes }: Props) {
     setLoading(true)
     api.dreamProposals()
       .then(p => {
-        setProposals(p)
-        if (selectFirst) setSelected(p[0] ?? null)
+        const filtered = p.filter(item => !ignored.has(proposalSignature(item)))
+        setProposals(filtered)
+        if (selectFirst) setSelected(filtered[0] ?? null)
       })
       .catch(() => {})
       .finally(() => setLoading(false))
@@ -72,10 +80,31 @@ export default function DreamView({ nodes }: Props) {
   }
 
   function ignoreProposal(proposal: DreamProposal) {
+    const nextIgnored = new Set(ignored)
+    nextIgnored.add(proposalSignature(proposal))
+    setIgnored(nextIgnored)
+    window.localStorage.setItem('silentnode.ignoredDreams', JSON.stringify(Array.from(nextIgnored).slice(-200)))
     const next = proposals.filter(p => p.id !== proposal.id)
     setProposals(next)
     setSelected(next[0] ?? null)
     toast('Proposal ignored')
+  }
+
+  function proposalSignature(proposal: DreamProposal) {
+    return [
+      proposal.kind,
+      proposal.from || '',
+      proposal.to || '',
+      proposal.node_id || '',
+      proposal.a || '',
+      proposal.b || '',
+    ].join(':')
+  }
+
+  function involvedNodes(proposal: DreamProposal) {
+    return [proposal.from, proposal.to, proposal.node_id, proposal.a, proposal.b]
+      .filter(Boolean)
+      .filter((id, index, arr) => arr.indexOf(id) === index) as string[]
   }
 
   return (
@@ -97,6 +126,7 @@ export default function DreamView({ nodes }: Props) {
           <div className="section-head">
             <span style={{ color: 'var(--violet)' }}>◈</span> Dream Proposals
             <span style={{ marginLeft: 4, color: 'var(--text-muted)' }}>({proposals.length})</span>
+            <button className="btn-xs" style={{ marginLeft: 'auto' }} onClick={() => loadProposals(false)}>Refresh</button>
           </div>
           <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
             {/* List */}
@@ -144,6 +174,7 @@ export default function DreamView({ nodes }: Props) {
               ) : (() => {
                 const col = KIND_COLORS[selected.kind] ?? 'var(--cyan)'
                 const icon = KIND_ICONS[selected.kind] ?? '◆'
+                const involved = involvedNodes(selected)
                 return (
                   <div className="anim-glow-in">
                     <div style={{ fontSize: 24, color: col, marginBottom: 8 }}>{icon}</div>
@@ -180,6 +211,20 @@ export default function DreamView({ nodes }: Props) {
                       {selected.similarity !== undefined && <span className="badge badge-cyan" style={{ fontSize: 9 }}>Similarity {(selected.similarity * 100).toFixed(0)}%</span>}
                       {selected.entropy !== undefined && <span className="badge badge-amber" style={{ fontSize: 9 }}>Entropy {(selected.entropy * 100).toFixed(0)}%</span>}
                     </div>
+                    {involved.length > 0 && (
+                      <div style={{ marginTop: 14, paddingTop: 12, borderTop: '1px solid var(--border)' }}>
+                        <div style={{ fontSize: 9, fontFamily: 'var(--font-head)', color: 'var(--text-muted)', letterSpacing: '0.1em', marginBottom: 6 }}>
+                          INVOLVED NODES
+                        </div>
+                        <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap' }}>
+                          {involved.map(id => {
+                            const node = nodeMap.get(id)
+                            const label = node?.nickname || node?.content.split('\n')[0] || id.slice(0, 8)
+                            return <span key={id} className="badge badge-cyan" title={id} style={{ fontSize: 9 }}>{label.slice(0, 34)}</span>
+                          })}
+                        </div>
+                      </div>
+                    )}
                   </div>
                 )
               })()}
