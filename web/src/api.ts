@@ -1,5 +1,6 @@
 import type {
   SNode, SEdge, Status, JournalEntry, SeasonReport, OracleSignal,
+  SearchResponse,
   Civilization, ResonancePair, Suggestion, HealthReport, PageRankEntry,
   BridgeEdge, DreamProposal,
   ContractData, WeightData, RitualData, LoreEntry,
@@ -354,6 +355,10 @@ export const api = {
 
   testTelegramNotification: (message?: string): Promise<{ ok: boolean; channel: string }> =>
     request('/settings/notifications/test', { method: 'POST', body: JSON.stringify({ message }) }),
+
+  // ── Search ────────────────────────────────────────────────────────────────
+  search: (q: string, limit?: number): Promise<SearchResponse> =>
+    request(`/search?q=${encodeURIComponent(q)}${limit ? `&limit=${limit}` : ''}`),
 
   // ── ML endpoints ──────────────────────────────────────────────────────────
   mlStatus: (): Promise<any> =>

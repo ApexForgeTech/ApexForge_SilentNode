@@ -977,6 +977,28 @@ pub struct TaskQuery {
 }
 
 #[derive(Deserialize)]
+pub struct SearchQuery {
+    pub q: String,
+    pub limit: Option<usize>,
+}
+
+#[derive(Serialize)]
+pub struct SearchResultItem {
+    pub kind: String,
+    pub id: String,
+    pub title: String,
+    pub preview: String,
+    pub node_type: Option<String>,
+    pub timestamp: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct SearchResponse {
+    pub items: Vec<SearchResultItem>,
+    pub total: usize,
+}
+
+#[derive(Deserialize)]
 pub struct AddDailyTaskRequest {
     pub title: String,
     pub date: Option<String>,
@@ -2582,6 +2604,58 @@ async fn put_journal(
     };
     save_current_snapshot(&app, snapshot, "journal update").await?;
     Ok(Json(response))
+}
+
+async fn get_search(
+    State(ws): State<SharedWorkspace>,
+    Query(q): Query<SearchQuery>,
+) -> impl IntoResponse {
+    let ws = ws.read().await;
+    let query = q.q.to_lowercase();
+    let limit = q.limit.unwrap_or(50).min(200);
+    let mut items: Vec<SearchResultItem> = Vec::new();
+
+    if !query.is_empty() {
+        for node in ws.graph.nodes() {
+            let nick = node_nickname(node);
+            if node.content.to_lowercase().contains(&query)
+                || nick.to_lowercase().contains(&query)
+            {
+                items.push(SearchResultItem {
+                    kind: "node".to_string(),
+                    id: node.id.to_string(),
+                    title: nick,
+                    preview: preview_text(&node.content, 120),
+                    node_type: Some(format!("{:?}", node.node_type).to_lowercase()),
+                    timestamp: Some(node.accessed_at.to_rfc3339()),
+                });
+            }
+        }
+
+        for entry in ws.journal.entries() {
+            if entry.content.to_lowercase().contains(&query) {
+                items.push(SearchResultItem {
+                    kind: "journal".to_string(),
+                    id: entry.id.to_string(),
+                    title: preview_text(&entry.content, 60),
+                    preview: preview_text(&entry.content, 160),
+                    node_type: None,
+                    timestamp: Some(entry.timestamp.to_rfc3339()),
+                });
+            }
+        }
+
+        items.sort_by(|a, b| {
+            b.timestamp
+                .as_deref()
+                .unwrap_or("")
+                .cmp(a.timestamp.as_deref().unwrap_or(""))
+        });
+        items.truncate(limit);
+    }
+
+    let total = items.len();
+    Json(SearchResponse { items, total })
 }
 
 async fn delete_journal(
@@ -5914,6 +5988,7 @@ pub fn build_router(app: AppState) -> Router {
             get(get_notification_settings).put(put_notification_settings),
         )
         .route("/settings/notifications/test", post(post_notification_test))
+        .route("/search", get(get_search))
         .route("/nodes", get(get_nodes).post(post_node))
         .route(
             "/nodes/bulk-delete",

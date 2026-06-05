@@ -38,6 +38,7 @@ const ForgeGenealogyView = lazy(() => import('./components/ForgeGenealogyView'))
 const VisionCoverageView = lazy(() => import('./components/VisionCoverageView'))
 const VaultView = lazy(() => import('./components/VaultView'))
 const SettingsView = lazy(() => import('./components/SettingsView'))
+const SearchView = lazy(() => import('./components/SearchView'))
 
 type Space = 'today' | 'universe' | 'memory' | 'systems' | 'dream'
 type Panel =
@@ -46,6 +47,7 @@ type Panel =
   | 'analytics' | 'trail' | 'archaeology' | 'reconstruction'
   | 'calendar' | 'membrane' | 'processes' | 'void' | 'dream' | 'identity'
   | 'modes' | 'terminal' | 'constellations' | 'genealogy' | 'vision' | 'vault' | 'settings'
+  | 'search'
 
 const SPACES: { id: Space; label: string }[] = [
   { id: 'today', label: 'Command' },
@@ -67,6 +69,7 @@ const PANELS: Record<Space, { id: Panel; label: string }[]> = {
   universe: [
     { id: 'overview', label: 'Graph' },
     { id: 'nodes', label: 'Nodes' },
+    { id: 'search', label: 'Search' },
     { id: 'souls', label: 'Souls' },
     { id: 'constellations', label: 'Life' },
     { id: 'void', label: 'Void' },
@@ -382,6 +385,7 @@ export default function App() {
                 {currentPanel === 'heatmap' && <HeatmapView />}
                 {currentPanel === 'mirror' && <MirrorView />}
                 {currentPanel === 'weather' && <WeatherView />}
+                {currentPanel === 'search' && <SearchView />}
                 {currentPanel === 'silence' && <SilenceView />}
                 {currentPanel === 'souls' && <SoulsView />}
                 {currentPanel === 'constellations' && <ConstellationsView />}

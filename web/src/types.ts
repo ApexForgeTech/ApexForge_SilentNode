@@ -683,3 +683,18 @@ export interface CrystallizationResult {
   size: number
   crystal_id: string | null
 }
+
+// ── Search ────────────────────────────────────────────────────────────────────
+export interface SearchResultItem {
+  kind: 'node' | 'journal'
+  id: string
+  title: string
+  preview: string
+  node_type?: string | null
+  timestamp?: string | null
+}
+
+export interface SearchResponse {
+  items: SearchResultItem[]
+  total: number
+}
